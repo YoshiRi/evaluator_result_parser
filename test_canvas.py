@@ -80,6 +80,40 @@ class DatasetManager:
         plt.grid()
         plt.show()
 
+    def distance_based_errors(self, bin_size=10):
+        """
+        Calculates bev_error and yaw_error averages based on distance intervals.
+
+        Parameters:
+            bin_size (int): Size of each distance bin (e.g., 10m).
+
+        Returns:
+            DataFrame: Aggregated bev_error and yaw_error by distance bins.
+        """
+        self.data['distance_bin'] = (self.data['distance_from_ego'] // bin_size) * bin_size
+        grouped = self.data.groupby('distance_bin').agg(
+            bev_error_avg=('bev_error', 'mean'),
+            yaw_error_avg=('heading_error_z', 'mean')
+        )
+        return grouped
+
+    def visualize_distance_errors(self, bin_size=10):
+        """
+        Visualizes bev_error and yaw_error averages based on distance intervals.
+
+        Parameters:
+            bin_size (int): Size of each distance bin (e.g., 10m).
+        """
+        grouped = self.distance_based_errors(bin_size)
+        grouped.plot(kind='line', figsize=(12, 8), marker='o')
+        plt.title('BEV and Yaw Errors by Distance Intervals')
+        plt.xlabel('Distance from Ego Vehicle (m)')
+        plt.ylabel('Error')
+        plt.legend(title='Error Type')
+        plt.tight_layout()
+        plt.grid()
+        plt.show()
+
     def distance_based_categoly_analysis(self, bin_size=10):
         """
         Calculates object counts by distance intervals and categories.
@@ -134,6 +168,9 @@ def main():
 
     # Visualize distance-based analysis by category
     manager.visualize_distance_analysis_by_category(bin_size=10)
+
+    # Visualize distance-based errors
+    manager.visualize_distance_errors(bin_size=10)
 
 if __name__ == "__main__":
     main()
