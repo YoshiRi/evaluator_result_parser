@@ -54,6 +54,32 @@ class ObjectExtractor:
             return obj
         return obj.lower() == 'true'
 
+    # "Frame": {"Ego": {"TransformStamped": {"header": {"stamp": {"sec": 1606799233, "nanosec": 249851000}, "frame_id": "map"}, "child_frame_id": "base_link", "transform": {"translation": {"x": 89529.32151795654, "y": 42417.52324213837, "z": 6.100472927093506}, "rotation": {"x": -0.0012963204108964923, "y": -0.012038447733785842, "z": 0.8606085035719773, "w": 0.509123166737829}}, "rotation_euler": {"roll": 0.01940406194940797, "pitch": -0.014489861037339223, "yaw": 2.0733150481017883}}}
+    @staticmethod
+    def parse_ego(frame: Dict[str, Any]) -> Dict[str, Any]:
+        """Parses ego information from the `Frame` field of each record."""
+        ego = frame.get('Ego', {})
+        transform = ego.get('TransformStamped', {})
+        transform_data = transform.get('transform', {})
+        header_stamp = transform.get('header', {}).get('stamp', {})
+        if not header_stamp:
+            return {}
+        timestamp = header_stamp.get('sec', None) + header_stamp.get('nanosec', 0) * 1e-9
+        translation = transform_data.get('translation', {})
+        rotation = transform_data.get('rotation', {})
+
+        return {
+            'timestamp': timestamp,
+            'object_type': 'Ego',
+            'position_x': translation.get('x', None),
+            'position_y': translation.get('y', None),
+            'position_z': translation.get('z', None),
+            'orientation_x': rotation.get('x', None),
+            'orientation_y': rotation.get('y', None),
+            'orientation_z': rotation.get('z', None),
+            'orientation_w': rotation.get('w', None),
+        }
+
     @staticmethod
     def extract_objects(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Extracts object information from the `criteria0` field of each frame, including timestamps and covariance data."""
@@ -64,11 +90,15 @@ class ObjectExtractor:
             if not frame:
                 continue
             result = record.get('Result', {})
-            stamp = record.get('Stamp', {}).get('System', None)
+            stamp = record.get('Stamp', {}).get('ROS', None)
             success = result.get('Success', None)
             criteria0 = frame.get('criteria0', {})
             objects = criteria0.get('Objects', [])
 
+            # append EGO info
+            extracted_objects.append(ObjectExtractor.parse_ego(frame))
+
+            # append object info
             for obj in objects:
                 extracted_objects.append({
                     'timestamp': stamp,
