@@ -7,13 +7,26 @@ camera-image + LiDAR-BEV plots for every row.
 Required columns in the input file
 ------------------------------------
 - ``t4dataset_id`` : dataset identifier used to download / locate the data
-- ``uuid``         : scene / sample UUID (used as an output sub-directory name)
+- ``uuid``         : scene / sample UUID (used as part of the output filename)
 - ``timestamp``    : target timestamp in **microseconds** (Unix time)
 
 Optional columns (used when present)
 --------------------------------------
+- ``status``       : group label (e.g. "degrade", "improved") — images are placed
+                    in a sub-directory named after this value; rows without a status
+                    (or with NaN) go into an "unknown" sub-directory
 - ``cameras``      : comma-separated camera channel names to render
 - ``description``  : free-text label added to plot titles
+
+Output structure
+-----------------
+All images for a given status are placed in the **same flat directory**:
+
+    <output_dir>/<status>/<t4dataset_id>_<uuid>_<timestamp>_cameras.png
+    <output_dir>/<status>/<t4dataset_id>_<uuid>_<timestamp>_pointcloud.png
+    <output_dir>/<status>/<t4dataset_id>_<uuid>_<timestamp>_meta.txt
+
+If no ``status`` column is present every image goes directly into <output_dir>.
 
 Storage modes
 --------------
@@ -65,6 +78,7 @@ class SceneRow:
     t4dataset_id: str
     uuid: str
     timestamp_us: int
+    status: Optional[str] = None        # e.g. "degrade", "improved"; None = no grouping
     cameras: Optional[List[str]] = field(default=None)
     description: str = ""
 
@@ -118,12 +132,20 @@ def df_to_rows(df: pd.DataFrame) -> List[SceneRow]:
             raw = str(r["cameras"]).strip()
             if raw:
                 cameras = [c.strip() for c in raw.split(",") if c.strip()]
+
+        status = None
+        if "status" in df.columns:
+            raw_status = r.get("status", None)
+            if pd.notna(raw_status) and str(raw_status).strip():
+                status = str(raw_status).strip()
+
         description = str(r.get("description", "")) if "description" in df.columns else ""
         rows.append(
             SceneRow(
                 t4dataset_id=str(r["t4dataset_id"]),
                 uuid=str(r["uuid"]),
                 timestamp_us=int(r["timestamp"]),
+                status=status,
                 cameras=cameras,
                 description=description,
             )
@@ -158,14 +180,39 @@ def resolve_dataset_path(
 # Single-row visualization
 # ---------------------------------------------------------------------------
 
+def _status_dir(output_root: Path, status: Optional[str], has_status_column: bool) -> Path:
+    """Return the output directory for a given status value.
+
+    - If the input has no ``status`` column → images go directly in output_root.
+    - If it has a status column but the value is blank/NaN → "unknown" sub-dir.
+    - Otherwise → sub-dir named after the status value.
+    """
+    if not has_status_column:
+        return output_root
+    return output_root / (status if status else "unknown")
+
+
+def _filename_prefix(row: SceneRow) -> str:
+    """Build the flat filename prefix: <t4dataset_id>_<uuid>_<timestamp_us>."""
+    # Sanitize components so they are safe as filename parts
+    safe = lambda s: str(s).replace("/", "-").replace(" ", "_")
+    return f"{safe(row.t4dataset_id)}_{safe(row.uuid)}_{row.timestamp_us}"
+
+
 def visualize_row(
     row: SceneRow,
     dataset_path: Path,
     output_root: Path,
     show_annotations: bool = True,
     version: Optional[str] = None,
+    has_status_column: bool = False,
 ) -> Path:
-    """Visualize one scene row. Returns the per-row output directory."""
+    """Visualize one scene row. Returns the output directory used.
+
+    All files for this row are written into a single flat directory
+    (``<output_root>/<status>/``) with a shared filename prefix
+    ``<t4dataset_id>_<uuid>_<timestamp_us>`` so they sort together.
+    """
     try:
         from t4_devkit import Tier4
     except ImportError:
@@ -181,14 +228,11 @@ def visualize_row(
         visualize_static,
     )
 
-    # Per-row output dir: <output_root>/<t4dataset_id>/<uuid>/<timestamp_us>/
-    row_out = (
-        output_root
-        / row.t4dataset_id
-        / row.uuid
-        / str(row.timestamp_us)
-    )
+    # Flat output directory: <output_root>/[<status>/]
+    row_out = _status_dir(output_root, row.status, has_status_column)
     row_out.mkdir(parents=True, exist_ok=True)
+
+    prefix = _filename_prefix(row)
 
     # Load dataset
     kwargs = {}
@@ -207,15 +251,13 @@ def visualize_row(
         f"Δ={delta_ms:.1f} ms  ts={sample.timestamp}"
     )
 
-    # Determine cameras
-    cameras = row.cameras  # None = all cameras
-
-    # Write metadata sidecar
-    meta_path = row_out / "meta.txt"
+    # Write metadata sidecar (same prefix, .txt extension)
+    meta_path = row_out / f"{prefix}_meta.txt"
     with open(meta_path, "w") as f:
         f.write(
             f"t4dataset_id : {row.t4dataset_id}\n"
             f"uuid         : {row.uuid}\n"
+            f"status       : {row.status}\n"
             f"target_ts_us : {row.timestamp_us}\n"
             f"sample_token : {sample.token}\n"
             f"sample_ts_us : {sample.timestamp}\n"
@@ -228,9 +270,10 @@ def visualize_row(
     visualize_static(
         t4,
         sample,
-        cameras=cameras,
+        cameras=row.cameras,
         show_annotations=show_annotations,
         save_dir=str(row_out),
+        filename_prefix=prefix,
     )
 
     return row_out
@@ -258,8 +301,12 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
     # Load input
     print(f"Loading input: {cfg.input_path}")
     df = load_input(cfg.input_path)
+    has_status_column = "status" in df.columns
     rows = df_to_rows(df)
     print(f"  {len(rows)} rows found.")
+    if has_status_column:
+        status_counts = df["status"].fillna("unknown").value_counts().to_dict()
+        print(f"  Status groups: {status_counts}")
 
     # Unique dataset IDs
     unique_ids = list(dict.fromkeys(r.t4dataset_id for r in rows))
@@ -309,6 +356,7 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
                     cfg.output_dir,
                     show_annotations=cfg.show_annotations,
                     version=cfg.version,
+                    has_status_column=has_status_column,
                 )
                 return RowResult(row=row, success=True, output_dir=out)
             except Exception as e:
@@ -376,8 +424,10 @@ def print_summary(results: List[RowResult], output_dir: Path) -> None:
             "t4dataset_id": r.row.t4dataset_id,
             "uuid": r.row.uuid,
             "timestamp_us": r.row.timestamp_us,
+            "status": r.row.status,
             "success": r.success,
             "output_dir": str(r.output_dir) if r.output_dir else "",
+            "filename_prefix": _filename_prefix(r.row) if r.success else "",
             "error": r.error,
         }
         for r in results

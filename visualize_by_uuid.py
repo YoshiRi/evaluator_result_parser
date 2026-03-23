@@ -88,6 +88,7 @@ def visualize_static(
     cameras: Optional[List[str]] = None,
     show_annotations: bool = True,
     save_dir: Optional[str] = None,
+    filename_prefix: Optional[str] = None,
 ) -> None:
     """Render images and a bird's-eye-view point cloud with matplotlib.
 
@@ -97,6 +98,9 @@ def visualize_static(
         cameras: Camera channels to display (None = all cameras).
         show_annotations: Overlay 2D/3D bounding boxes on images.
         save_dir: If given, save figures here instead of showing interactively.
+        filename_prefix: Prefix for saved filenames (default: timestamp).
+            E.g. "datasetA_sceneX_1609459200000000" produces
+            "datasetA_sceneX_1609459200000000_cameras.png".
     """
     import matplotlib
     if save_dir:
@@ -106,6 +110,7 @@ def visualize_static(
     from PIL import Image  # Pillow
 
     ts_us = sample.timestamp
+    prefix = filename_prefix if filename_prefix else str(ts_us)
     print(f"[visualize_static] Rendering sample token={sample.token}, timestamp={ts_us} us")
 
     available_cameras = list_camera_channels(t4, sample)
@@ -115,11 +120,11 @@ def visualize_static(
     if not selected_cameras:
         print("  WARNING: No matching camera channels found in this sample.")
     else:
-        _plot_images(t4, sample, selected_cameras, show_annotations, save_dir)
+        _plot_images(t4, sample, selected_cameras, show_annotations, save_dir, prefix)
 
     lidar_channels = list_lidar_channels(t4, sample)
     if lidar_channels:
-        _plot_bev_pointcloud(t4, sample, lidar_channels[0], show_annotations, save_dir)
+        _plot_bev_pointcloud(t4, sample, lidar_channels[0], show_annotations, save_dir, prefix)
     else:
         print("  WARNING: No LiDAR data found in this sample.")
 
@@ -127,7 +132,7 @@ def visualize_static(
         plt.show()
 
 
-def _plot_images(t4, sample, camera_channels, show_annotations, save_dir):
+def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filename_prefix=None):
     """Create a figure with one subplot per camera."""
     import matplotlib.pyplot as plt
     from PIL import Image
@@ -185,13 +190,14 @@ def _plot_images(t4, sample, camera_channels, show_annotations, save_dir):
 
     if save_dir:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
-        out = Path(save_dir) / f"cameras_{ts_us}.png"
+        prefix = filename_prefix if filename_prefix else str(ts_us)
+        out = Path(save_dir) / f"{prefix}_cameras.png"
         fig.savefig(out, dpi=150)
         print(f"  Saved: {out}")
     plt.close(fig)
 
 
-def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir):
+def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, filename_prefix=None):
     """Bird's-eye-view scatter plot of the LiDAR point cloud."""
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
@@ -248,7 +254,8 @@ def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir):
 
     if save_dir:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
-        out = Path(save_dir) / f"pointcloud_{ts_us}.png"
+        prefix = filename_prefix if filename_prefix else str(ts_us)
+        out = Path(save_dir) / f"{prefix}_pointcloud.png"
         fig.savefig(out, dpi=150)
         print(f"  Saved: {out}")
     plt.close(fig)
