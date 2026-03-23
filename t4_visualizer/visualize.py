@@ -116,6 +116,58 @@ def _project_ego_to_cam(t4, sample_data_token: str, point_ego) -> Optional[tuple
         return None
 
 
+def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
+                          img_w: int, img_h: int) -> Optional[tuple]:
+    """Project the 8 corners of a detection BBOX onto a camera image.
+
+    Returns (u_min, v_min, u_max, v_max) clipped to the image bounds,
+    or None if no corner projects in front of the camera or the
+    resulting ROI is empty / fully outside the image.
+
+    Only corners with z > 0 in camera frame are used, so the result is a
+    safe under-estimate when the box straddles the image plane.
+    """
+    if obj.width <= 0 or obj.length <= 0 or obj.height <= 0:
+        return None
+
+    hw, hl, hh = obj.width / 2.0, obj.length / 2.0, obj.height / 2.0
+    cx, cy, cz = obj.x, obj.y, obj.z
+
+    # 8 corners of the axis-aligned bounding box in ego frame
+    corners = [
+        (cx + dx * hw, cy + dy * hl, cz + dz * hh)
+        for dx in (-1.0, 1.0)
+        for dy in (-1.0, 1.0)
+        for dz in (-1.0, 1.0)
+    ]
+
+    us, vs = [], []
+    for corner in corners:
+        uv = _project_ego_to_cam(t4, sample_data_token, corner)
+        if uv is not None:        # None means behind the camera
+            us.append(uv[0])
+            vs.append(uv[1])
+
+    if not us:
+        return None
+
+    # Raw bounding rect of projected corners
+    u_min_raw, u_max_raw = min(us), max(us)
+    v_min_raw, v_max_raw = min(vs), max(vs)
+
+    # Clip to image bounds
+    u_min = max(0.0, min(u_min_raw, float(img_w - 1)))
+    u_max = max(0.0, min(u_max_raw, float(img_w - 1)))
+    v_min = max(0.0, min(v_min_raw, float(img_h - 1)))
+    v_max = max(0.0, min(v_max_raw, float(img_h - 1)))
+
+    # Reject degenerate / fully-outside rectangles
+    if u_max - u_min < 2 or v_max - v_min < 2:
+        return None
+
+    return (u_min, v_min, u_max, v_max)
+
+
 def _get_target_ann_tokens(t4, sample, target_objects: List[TargetObject]) -> Set[str]:
     """Return sample_annotation tokens for target instance_tokens in this sample."""
     if not target_objects:
@@ -339,17 +391,36 @@ def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filena
             except Exception:
                 pass
 
-        # Project detection positions (ego frame) onto this camera
+        # Project detection BBOX / position onto this camera
         if target_objects:
             img_w, img_h = img.size
             for obj in target_objects:
+                # --- Try full 3D BBOX → 2D ROI first ---
+                roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
+                if roi is not None:
+                    u_min, v_min, u_max, v_max = roi
+                    bw, bh = u_max - u_min, v_max - v_min
+                    rect = patches.Rectangle(
+                        (u_min, v_min), bw, bh,
+                        linewidth=2.0, edgecolor="yellow", facecolor="none",
+                        linestyle="--", zorder=7,
+                    )
+                    ax.add_patch(rect)
+                    ax.text(
+                        u_min, v_min - 3,
+                        f"det:{obj.label or '?'}",
+                        color="yellow", fontsize=7, fontweight="bold",
+                        va="bottom", zorder=7,
+                    )
+                    continue  # skip center-only marker below
+
+                # --- Fallback: center point marker ---
                 uv = _project_ego_to_cam(t4, token, [obj.x, obj.y, obj.z])
                 if uv is None:
                     continue
                 u, v = uv
                 if not (0 <= u < img_w and 0 <= v < img_h):
                     continue
-                # Cross + circle marker for detection position
                 ax.plot(u, v, "+", color="yellow", markersize=18,
                         markeredgewidth=2.5, zorder=7)
                 circle = patches.Circle(
