@@ -77,11 +77,18 @@ def find_sample_by_scene_and_index(t4, scene_name: str, frame_index: int):
     """
     scene = next((s for s in t4.scene if s.name == scene_name), None)
     if scene is None:
-        available = [s.name for s in t4.scene]
-        raise ValueError(
-            f"Scene '{scene_name}' not found in dataset.\n"
-            f"Available scenes: {available}"
-        )
+        available = t4.scene
+        if len(available) == 1:
+            print(
+                f"  WARNING: Scene '{scene_name}' not found; "
+                f"falling back to the only scene in dataset: '{available[0].name}'"
+            )
+            scene = available[0]
+        else:
+            raise ValueError(
+                f"Scene '{scene_name}' not found in dataset.\n"
+                f"Available scenes: {[s.name for s in available]}"
+            )
 
     token = scene.first_sample_token
     for i in range(frame_index):
