@@ -61,6 +61,58 @@ def _box_token(box) -> str:
     return ""
 
 
+def _project_ego_to_cam(t4, sample_data_token: str, point_ego) -> Optional[tuple]:
+    """Project a 3D point in ego (base_link) frame to camera pixel (u, v).
+
+    Uses calibrated_sensor from the T4 dataset (no rosbag / TF needed).
+
+    Args:
+        t4: Tier4 instance.
+        sample_data_token: Token of the camera SampleData.
+        point_ego: (x, y, z) in ego / base_link frame.
+
+    Returns:
+        (u, v) float pixel coordinates, or None if behind the camera or
+        if the calibrated sensor has no intrinsics (i.e. LiDAR).
+    """
+    try:
+        sd = t4.get("sample_data", sample_data_token)
+        cs = t4.get("calibrated_sensor", sd.calibrated_sensor_token)
+
+        # camera_intrinsic is empty for LiDAR
+        K_raw = cs.camera_intrinsic
+        if K_raw is None or len(K_raw) == 0:
+            return None
+        K = np.array(K_raw, dtype=float)
+        if K.shape != (3, 3):
+            return None
+
+        t_ego = np.array(cs.translation, dtype=float)
+        p = np.array(point_ego, dtype=float)
+
+        # Rotation: sensor → ego (stored as [w, x, y, z] in T4)
+        rot = cs.rotation
+        if hasattr(rot, "inverse"):
+            # Already a pyquaternion Quaternion
+            q = rot
+        else:
+            # List/array [w, x, y, z]
+            from pyquaternion import Quaternion
+            q = Quaternion(np.array(rot, dtype=float))
+
+        # ego → sensor:  p_cam = q^{-1} * (p_ego - t)
+        p_cam = q.inverse.rotate(p - t_ego)
+
+        if p_cam[2] <= 0.1:          # behind (or too close to) camera
+            return None
+
+        uvw = K @ p_cam
+        return (float(uvw[0] / uvw[2]), float(uvw[1] / uvw[2]))
+
+    except Exception:
+        return None
+
+
 def _get_target_ann_tokens(t4, sample, target_objects: List[TargetObject]) -> Set[str]:
     """Return sample_annotation tokens for target instance_tokens in this sample."""
     if not target_objects:
@@ -210,6 +262,7 @@ def visualize_static(
         _plot_images(
             t4, sample, selected_cameras, show_annotations, save_dir, prefix,
             target_ann_tokens=target_ann_tokens,
+            target_objects=target_objects,
         )
 
     lidar_channels = list_lidar_channels(t4, sample)
@@ -226,7 +279,7 @@ def visualize_static(
         plt.show()
 
 
-def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filename_prefix=None, target_ann_tokens=None):
+def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filename_prefix=None, target_ann_tokens=None, target_objects=None):
     """Create a figure with one subplot per camera."""
     import matplotlib.pyplot as plt
     from PIL import Image
@@ -281,6 +334,30 @@ def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filena
                     )
             except Exception:
                 pass
+
+        # Project detection positions (ego frame) onto this camera
+        if target_objects:
+            img_w, img_h = img.size
+            for obj in target_objects:
+                uv = _project_ego_to_cam(t4, token, [obj.x, obj.y, obj.z])
+                if uv is None:
+                    continue
+                u, v = uv
+                if not (0 <= u < img_w and 0 <= v < img_h):
+                    continue
+                # Cross + circle marker for detection position
+                ax.plot(u, v, "+", color="yellow", markersize=18,
+                        markeredgewidth=2.5, zorder=7)
+                circle = patches.Circle(
+                    (u, v), radius=12,
+                    fill=False, edgecolor="yellow", linewidth=2.0, zorder=7,
+                )
+                ax.add_patch(circle)
+                ax.text(
+                    u + 14, v, f"det:{obj.label or '?'}",
+                    color="yellow", fontsize=7, fontweight="bold",
+                    va="center", zorder=7,
+                )
 
     # Hide unused subplots
     for i in range(len(camera_channels), len(axes)):
