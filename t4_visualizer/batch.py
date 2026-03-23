@@ -146,6 +146,9 @@ def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
     has_y = "y" in df.columns
     has_z = "z" in df.columns
     has_label = "label" in df.columns
+    has_width = "width" in df.columns
+    has_length = "length" in df.columns
+    has_height = "height" in df.columns
 
     for _, r in df.iterrows():
         key: FrameKey = (
@@ -194,6 +197,9 @@ def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
                     y=float(r["y"]) if has_y and pd.notna(r.get("y")) else 0.0,
                     z=float(r["z"]) if has_z and pd.notna(r.get("z")) else 0.0,
                     label=str(r["label"]) if has_label and pd.notna(r.get("label")) else "",
+                    width=float(r["width"]) if has_width and pd.notna(r.get("width")) else 0.0,
+                    length=float(r["length"]) if has_length and pd.notna(r.get("length")) else 0.0,
+                    height=float(r["height"]) if has_height and pd.notna(r.get("height")) else 0.0,
                 ))
 
     return list(seen.values())

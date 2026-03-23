@@ -46,6 +46,9 @@ class TargetObject:
     y: float = 0.0
     z: float = 0.0
     label: str = ""
+    width: float = 0.0   # BBOX dimensions in ego frame [m]
+    length: float = 0.0
+    height: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -403,8 +406,20 @@ def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, 
         print(f"  WARNING: Could not load point cloud from {data_path}")
         return
 
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    intensity = points[:, 3] if points.shape[1] > 3 else np.ones(len(x))
+    x_all, y_all, z_all = points[:, 0], points[:, 1], points[:, 2]
+    intensity_all = points[:, 3] if points.shape[1] > 3 else np.ones(len(x_all))
+
+    # Crop to ±10 m around the first target object when available
+    CROP_RADIUS = 10.0
+    crop_center = None
+    if target_objects:
+        cx, cy = target_objects[0].x, target_objects[0].y
+        crop_center = (cx, cy)
+        mask = (np.abs(x_all - cx) <= CROP_RADIUS) & (np.abs(y_all - cy) <= CROP_RADIUS)
+        x, y, z = x_all[mask], y_all[mask], z_all[mask]
+        intensity = intensity_all[mask]
+    else:
+        x, y, z, intensity = x_all, y_all, z_all, intensity_all
 
     # Down-sample for speed
     max_pts = 80_000
@@ -424,29 +439,44 @@ def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, 
         except Exception:
             pass
 
-    # Draw detection position markers for target objects (from CSV x,y coords)
-    # NOTE: CSV x,y are in ego/vehicle frame; LiDAR BEV may be in sensor frame.
-    # These markers are an approximate guide — use highlighted GT boxes for exact location.
+    # Draw detection BBOX and position marker for each target object
     if target_objects:
         for obj in target_objects:
+            # BBOX rectangle (axis-aligned, using width × length footprint)
+            if obj.width > 0 and obj.length > 0:
+                half_w, half_l = obj.width / 2.0, obj.length / 2.0
+                rect = patches.Rectangle(
+                    (obj.x - half_w, obj.y - half_l),
+                    obj.width, obj.length,
+                    linewidth=2.0, edgecolor="yellow", facecolor="none",
+                    linestyle="--", zorder=6,
+                )
+                ax.add_patch(rect)
+            # Center marker
             ax.plot(
                 obj.x, obj.y, "*",
                 color="yellow", markersize=16,
                 markeredgecolor="black", markeredgewidth=0.8,
-                zorder=6,
+                zorder=7,
             )
             ax.annotate(
                 f"{obj.label or 'target'}\n({obj.x:.1f},{obj.y:.1f})",
                 (obj.x, obj.y),
                 xytext=(6, 6), textcoords="offset points",
                 color="yellow", fontsize=7, fontweight="bold",
-                zorder=6,
+                zorder=7,
             )
 
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
     ax.set_aspect("equal")
     ax.set_title(f"LiDAR BEV — {lidar_channel}")
+
+    # Fix axis limits to crop region
+    if crop_center is not None:
+        cx, cy = crop_center
+        ax.set_xlim(cx - CROP_RADIUS, cx + CROP_RADIUS)
+        ax.set_ylim(cy - CROP_RADIUS, cy + CROP_RADIUS)
 
     ts_us = sample.timestamp
     fig.suptitle(
