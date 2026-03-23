@@ -1,37 +1,33 @@
-"""T4 dataset downloader — pluggable interface.
+"""T4 dataset downloader using ``webauto data annotation-dataset pull``.
 
-This module defines the contract for downloading T4 datasets by ID and provides
-a stub implementation that you can replace with your actual download logic.
+Default download command
+------------------------
+    webauto data annotation-dataset pull \\
+        --project-id <project_id> \\
+        --annotation-dataset-id <t4dataset_id> \\
+        --output <dest_dir>/<t4dataset_id>
 
-How to plug in your real downloader
-------------------------------------
-Option A — Replace the function body of ``_download_impl``:
+Configuration (in order of precedence)
+---------------------------------------
+1. Environment variable ``T4_DOWNLOAD_CMD`` (full shell template):
 
-    def _download_impl(t4dataset_id: str, dest_dir: Path) -> Path:
-        # call your existing download script here
-        import subprocess
-        subprocess.run(["your_download_script.py", t4dataset_id, str(dest_dir)], check=True)
-        return dest_dir / t4dataset_id
+       T4_DOWNLOAD_CMD="webauto data annotation-dataset pull \\
+           --project-id my_proj \\
+           --annotation-dataset-id {t4dataset_id} \\
+           --output {dataset_path}"
 
-Option B — Point DOWNLOAD_SCRIPT_PATH to your CLI script:
+   Placeholders: ``{t4dataset_id}``, ``{dest_dir}``, ``{dataset_path}``
+   (``{dataset_path}`` == ``{dest_dir}/{t4dataset_id}``)
 
-    DOWNLOAD_SCRIPT_PATH = "/path/to/download_t4dataset.py"
+2. Module-level constants ``WEBAUTO_PROJECT_ID`` / ``DOWNLOAD_CMD_TEMPLATE``.
 
-    The script must accept:  <script> <t4dataset_id> <dest_dir>
-    and download the dataset into ``dest_dir/<t4dataset_id>/``.
-
-Option C — Set the environment variable T4_DOWNLOAD_CMD:
-
-    T4_DOWNLOAD_CMD="my_download_tool {t4dataset_id} {dest_dir}"
-    The placeholders ``{t4dataset_id}`` and ``{dest_dir}`` are expanded at runtime.
+3. Environment variable ``WEBAUTO_PROJECT_ID`` to override the project ID only.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -40,12 +36,11 @@ from typing import Optional
 # Configuration — edit these to match your environment
 # ---------------------------------------------------------------------------
 
-# Path to an existing CLI download script.
-# Set to None to use the Python function _download_impl() instead.
-DOWNLOAD_SCRIPT_PATH: Optional[str] = None
+# webauto project ID.  Override with env var WEBAUTO_PROJECT_ID.
+WEBAUTO_PROJECT_ID: str = os.environ.get("WEBAUTO_PROJECT_ID", "x2_dev")
 
-# Shell command template. Overrides DOWNLOAD_SCRIPT_PATH if set.
-# Example: "my_downloader --id {t4dataset_id} --out {dest_dir}"
+# Full shell command template.  Overrides the default webauto command when set.
+# Available placeholders: {t4dataset_id}, {dest_dir}, {dataset_path}
 DOWNLOAD_CMD_TEMPLATE: Optional[str] = os.environ.get("T4_DOWNLOAD_CMD")
 
 
@@ -83,14 +78,12 @@ def download_dataset(t4dataset_id: str, dest_dir: Path) -> Path:
         print(f"  [downloader] Dataset already exists, skipping download: {expected_path}")
         return expected_path
 
-    print(f"  [downloader] Downloading {t4dataset_id} → {dest_dir}")
+    print(f"  [downloader] Downloading {t4dataset_id} → {expected_path}")
 
     if DOWNLOAD_CMD_TEMPLATE:
-        _run_cmd_template(DOWNLOAD_CMD_TEMPLATE, t4dataset_id, dest_dir)
-    elif DOWNLOAD_SCRIPT_PATH:
-        _run_script(DOWNLOAD_SCRIPT_PATH, t4dataset_id, dest_dir)
+        _run_cmd_template(DOWNLOAD_CMD_TEMPLATE, t4dataset_id, dest_dir, expected_path)
     else:
-        _download_impl(t4dataset_id, dest_dir)
+        _download_impl(t4dataset_id, dest_dir, expected_path)
 
     if not expected_path.exists():
         raise DownloadError(
@@ -133,34 +126,37 @@ def _looks_like_t4dataset(path: Path) -> bool:
     return (path / "sample.json").exists() or (path / "scene.json").exists()
 
 
-def _run_cmd_template(template: str, t4dataset_id: str, dest_dir: Path) -> None:
-    cmd = template.format(t4dataset_id=t4dataset_id, dest_dir=str(dest_dir))
+def _run_cmd_template(
+    template: str, t4dataset_id: str, dest_dir: Path, dataset_path: Path
+) -> None:
+    cmd = template.format(
+        t4dataset_id=t4dataset_id,
+        dest_dir=str(dest_dir),
+        dataset_path=str(dataset_path),
+    )
     print(f"  [downloader] Running: {cmd}")
     result = subprocess.run(cmd, shell=True)
     if result.returncode != 0:
         raise DownloadError(f"Download command failed (exit {result.returncode}): {cmd}")
 
 
-def _run_script(script_path: str, t4dataset_id: str, dest_dir: Path) -> None:
-    cmd = [sys.executable, script_path, t4dataset_id, str(dest_dir)]
+def _download_impl(t4dataset_id: str, dest_dir: Path, dataset_path: Path) -> None:
+    """Download via ``webauto data annotation-dataset pull``.
+
+    Downloads the dataset directly into ``dataset_path``
+    (= ``dest_dir / t4dataset_id``) so that the expected path check passes.
+    """
+    cmd = [
+        "webauto", "data", "annotation-dataset", "pull",
+        "--project-id", WEBAUTO_PROJECT_ID,
+        "--annotation-dataset-id", t4dataset_id,
+        "--output", str(dataset_path),
+    ]
     print(f"  [downloader] Running: {' '.join(cmd)}")
     result = subprocess.run(cmd)
     if result.returncode != 0:
         raise DownloadError(
-            f"Download script failed (exit {result.returncode}): {script_path}"
+            f"webauto download failed (exit {result.returncode}) for dataset '{t4dataset_id}'.\n"
+            f"Command: {' '.join(cmd)}\n"
+            "Check that `webauto` is installed and you are logged in."
         )
-
-
-def _download_impl(t4dataset_id: str, dest_dir: Path) -> None:
-    """Stub implementation — replace this with your actual download logic.
-
-    This stub raises an error to remind you to plug in the real downloader.
-    """
-    raise DownloadError(
-        f"No downloader is configured for dataset '{t4dataset_id}'.\n\n"
-        "To fix this, edit downloader.py and either:\n"
-        "  1. Set DOWNLOAD_SCRIPT_PATH to your existing download script path.\n"
-        "  2. Set DOWNLOAD_CMD_TEMPLATE or the T4_DOWNLOAD_CMD env variable.\n"
-        "  3. Implement _download_impl() directly.\n\n"
-        "See the module docstring in downloader.py for details."
-    )
