@@ -31,15 +31,55 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import numpy as np
+
+
+@dataclass
+class TargetObject:
+    """One target object to highlight in the visualization (from CSV row)."""
+    uuid: str           # instance_token in T4 dataset
+    x: float = 0.0     # detection position in ego frame (from CSV)
+    y: float = 0.0
+    z: float = 0.0
+    label: str = ""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _box_token(box) -> str:
+    """Extract the annotation token from a Box2D or Box3D object."""
+    for attr in ("token", "annotation_token"):
+        val = getattr(box, attr, None)
+        if val:
+            return str(val)
+    return ""
+
+
+def _get_target_ann_tokens(t4, sample, target_objects: List[TargetObject]) -> Set[str]:
+    """Return sample_annotation tokens for target instance_tokens in this sample."""
+    if not target_objects:
+        return set()
+    instance_tokens = {obj.uuid for obj in target_objects}
+    result = set()
+    try:
+        for ann in t4.sample_annotation:
+            if ann.sample_token == sample.token and ann.instance_token in instance_tokens:
+                result.add(ann.token)
+    except Exception as e:
+        print(f"  WARNING: Could not resolve annotation tokens: {e}")
+    if not result:
+        print(
+            f"  WARNING: No annotation found for instance_tokens {instance_tokens}. "
+            "Detection position markers will be drawn in BEV as fallback."
+        )
+    return result
+
 
 def find_closest_sample(t4, timestamp_us: int):
     """Return the Sample record whose timestamp is closest to *timestamp_us*.
@@ -133,6 +173,7 @@ def visualize_static(
     show_annotations: bool = True,
     save_dir: Optional[str] = None,
     filename_prefix: Optional[str] = None,
+    target_objects: Optional[List[TargetObject]] = None,
 ) -> None:
     """Render images and a bird's-eye-view point cloud with matplotlib.
 
@@ -161,14 +202,23 @@ def visualize_static(
     selected_cameras = cameras if cameras else available_cameras
     selected_cameras = [c for c in selected_cameras if c in available_cameras]
 
+    target_ann_tokens = _get_target_ann_tokens(t4, sample, target_objects or [])
+
     if not selected_cameras:
         print("  WARNING: No matching camera channels found in this sample.")
     else:
-        _plot_images(t4, sample, selected_cameras, show_annotations, save_dir, prefix)
+        _plot_images(
+            t4, sample, selected_cameras, show_annotations, save_dir, prefix,
+            target_ann_tokens=target_ann_tokens,
+        )
 
     lidar_channels = list_lidar_channels(t4, sample)
     if lidar_channels:
-        _plot_bev_pointcloud(t4, sample, lidar_channels[0], show_annotations, save_dir, prefix)
+        _plot_bev_pointcloud(
+            t4, sample, lidar_channels[0], show_annotations, save_dir, prefix,
+            target_ann_tokens=target_ann_tokens,
+            target_objects=target_objects or [],
+        )
     else:
         print("  WARNING: No LiDAR data found in this sample.")
 
@@ -176,7 +226,7 @@ def visualize_static(
         plt.show()
 
 
-def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filename_prefix=None):
+def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filename_prefix=None, target_ann_tokens=None):
     """Create a figure with one subplot per camera."""
     import matplotlib.pyplot as plt
     from PIL import Image
@@ -212,12 +262,23 @@ def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filena
             # box is a Box2D with .roi attribute (l, t, r, b) or similar
             try:
                 roi = box.roi  # (left, top, right, bottom)
-                x, y, w, h = roi[0], roi[1], roi[2] - roi[0], roi[3] - roi[1]
+                bx, by, w, h = roi[0], roi[1], roi[2] - roi[0], roi[3] - roi[1]
+                is_target = bool(target_ann_tokens) and _box_token(box) in target_ann_tokens
+                color = "red" if is_target else "lime"
+                lw = 2.5 if is_target else 1.0
                 rect = patches.Rectangle(
-                    (x, y), w, h,
-                    linewidth=1.5, edgecolor="lime", facecolor="none"
+                    (bx, by), w, h,
+                    linewidth=lw, edgecolor=color, facecolor="none",
+                    zorder=3 if is_target else 2,
                 )
                 ax.add_patch(rect)
+                if is_target:
+                    label_text = getattr(box, "label", None) or ""
+                    ax.text(
+                        bx, by - 3, f"[TARGET] {label_text}",
+                        color="red", fontsize=7, fontweight="bold",
+                        va="bottom", zorder=4,
+                    )
             except Exception:
                 pass
 
@@ -241,7 +302,7 @@ def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filena
     plt.close(fig)
 
 
-def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, filename_prefix=None):
+def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, filename_prefix=None, target_ann_tokens=None, target_objects=None):
     """Bird's-eye-view scatter plot of the LiDAR point cloud."""
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
@@ -280,9 +341,29 @@ def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, 
     # Draw 3D box footprints (BEV)
     for box in boxes_3d:
         try:
-            _draw_box_bev(ax, box)
+            is_target = bool(target_ann_tokens) and _box_token(box) in target_ann_tokens
+            _draw_box_bev(ax, box, highlight=is_target)
         except Exception:
             pass
+
+    # Draw detection position markers for target objects (from CSV x,y coords)
+    # NOTE: CSV x,y are in ego/vehicle frame; LiDAR BEV may be in sensor frame.
+    # These markers are an approximate guide — use highlighted GT boxes for exact location.
+    if target_objects:
+        for obj in target_objects:
+            ax.plot(
+                obj.x, obj.y, "*",
+                color="yellow", markersize=16,
+                markeredgecolor="black", markeredgewidth=0.8,
+                zorder=6,
+            )
+            ax.annotate(
+                f"{obj.label or 'target'}\n({obj.x:.1f},{obj.y:.1f})",
+                (obj.x, obj.y),
+                xytext=(6, 6), textcoords="offset points",
+                color="yellow", fontsize=7, fontweight="bold",
+                zorder=6,
+            )
 
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
@@ -305,10 +386,14 @@ def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, 
     plt.close(fig)
 
 
-def _draw_box_bev(ax, box):
+def _draw_box_bev(ax, box, highlight: bool = False):
     """Draw the BEV footprint of a Box3D on a matplotlib Axes."""
     import matplotlib.patches as patches
-    from matplotlib.patches import FancyArrow
+
+    color = "yellow" if highlight else "cyan"
+    lw = 2.5 if highlight else 1.0
+    arrow_color = "red" if highlight else "orange"
+    zorder = 4 if highlight else 2
 
     # box.center: [x, y, z], box.size: [w, l, h], box.rotation: Quaternion
     center = box.center
@@ -322,21 +407,28 @@ def _draw_box_bev(ax, box):
         bev = corners[:2, 4:]  # (2, 4) — x and y of 4 bottom corners
         xs = np.append(bev[0], bev[0, 0])
         ys = np.append(bev[1], bev[1, 0])
-        ax.plot(xs, ys, color="red", linewidth=1.2)
+        ax.plot(xs, ys, color=color, linewidth=lw, zorder=zorder)
         # Draw heading arrow from center to front midpoint
         front_mid = (bev[:, 0] + bev[:, 1]) / 2
         ax.annotate(
             "",
             xy=(front_mid[0], front_mid[1]),
             xytext=(center[0], center[1]),
-            arrowprops=dict(arrowstyle="->", color="orange", lw=1.2),
+            arrowprops=dict(arrowstyle="->", color=arrow_color, lw=lw),
+            zorder=zorder,
         )
+        if highlight:
+            ax.text(
+                center[0], center[1], "[T]",
+                color="yellow", fontsize=7, fontweight="bold",
+                ha="center", va="center", zorder=5,
+            )
     except AttributeError:
         # Fallback: draw a simple rectangle from center + size
         w, l = float(size[0]), float(size[1])
         rect = patches.Rectangle(
             (center[0] - w / 2, center[1] - l / 2), w, l,
-            linewidth=1.2, edgecolor="red", facecolor="none"
+            linewidth=lw, edgecolor=color, facecolor="none", zorder=zorder,
         )
         ax.add_patch(rect)
 

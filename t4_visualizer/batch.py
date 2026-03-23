@@ -64,6 +64,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from t4_visualizer.visualize import TargetObject
+
 
 # ---------------------------------------------------------------------------
 # Frame key type  (t4dataset_id, scenario_name, frame_index)
@@ -86,6 +88,7 @@ class FrameRow:
     status: Optional[str] = None
     cameras: Optional[List[str]] = field(default=None)
     description: str = ""
+    target_objects: List[TargetObject] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -138,44 +141,60 @@ def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
     """
     seen: Dict[FrameKey, FrameRow] = {}
 
+    has_uuid = "uuid" in df.columns
+    has_x = "x" in df.columns
+    has_y = "y" in df.columns
+    has_z = "z" in df.columns
+    has_label = "label" in df.columns
+
     for _, r in df.iterrows():
         key: FrameKey = (
             str(r["t4dataset_id"]),
             str(r["scenario_name"]),
             int(r["frame_index"]),
         )
-        if key in seen:
-            continue  # already registered, skip duplicate
+        if key not in seen:
+            cameras: Optional[List[str]] = None
+            if "cameras" in df.columns and pd.notna(r.get("cameras")):
+                raw = str(r["cameras"]).strip()
+                if raw:
+                    cameras = [c.strip() for c in raw.split(",") if c.strip()]
 
-        cameras: Optional[List[str]] = None
-        if "cameras" in df.columns and pd.notna(r.get("cameras")):
-            raw = str(r["cameras"]).strip()
-            if raw:
-                cameras = [c.strip() for c in raw.split(",") if c.strip()]
+            status: Optional[str] = None
+            if "status" in df.columns:
+                raw_status = r.get("status")
+                if pd.notna(raw_status) and str(raw_status).strip():
+                    status = str(raw_status).strip()
 
-        status: Optional[str] = None
-        if "status" in df.columns:
-            raw_status = r.get("status")
-            if pd.notna(raw_status) and str(raw_status).strip():
-                status = str(raw_status).strip()
+            t4dataset_name = ""
+            if "t4dataset_name" in df.columns and pd.notna(r.get("t4dataset_name")):
+                t4dataset_name = str(r["t4dataset_name"]).strip()
 
-        t4dataset_name = ""
-        if "t4dataset_name" in df.columns and pd.notna(r.get("t4dataset_name")):
-            t4dataset_name = str(r["t4dataset_name"]).strip()
+            description = ""
+            if "description" in df.columns and pd.notna(r.get("description")):
+                description = str(r["description"])
 
-        description = ""
-        if "description" in df.columns and pd.notna(r.get("description")):
-            description = str(r["description"])
+            seen[key] = FrameRow(
+                t4dataset_id=key[0],
+                t4dataset_name=t4dataset_name,
+                scenario_name=key[1],
+                frame_index=key[2],
+                status=status,
+                cameras=cameras,
+                description=description,
+            )
 
-        seen[key] = FrameRow(
-            t4dataset_id=key[0],
-            t4dataset_name=t4dataset_name,
-            scenario_name=key[1],
-            frame_index=key[2],
-            status=status,
-            cameras=cameras,
-            description=description,
-        )
+        # Collect target object for every row (multiple objects per frame supported)
+        if has_uuid:
+            raw_uuid = r.get("uuid")
+            if pd.notna(raw_uuid) and str(raw_uuid).strip():
+                seen[key].target_objects.append(TargetObject(
+                    uuid=str(raw_uuid).strip(),
+                    x=float(r["x"]) if has_x and pd.notna(r.get("x")) else 0.0,
+                    y=float(r["y"]) if has_y and pd.notna(r.get("y")) else 0.0,
+                    z=float(r["z"]) if has_z and pd.notna(r.get("z")) else 0.0,
+                    label=str(r["label"]) if has_label and pd.notna(r.get("label")) else "",
+                ))
 
     return list(seen.values())
 
@@ -312,6 +331,7 @@ def visualize_frame(
         show_annotations=show_annotations,
         save_dir=str(frame_out),
         filename_prefix=prefix,
+        target_objects=frame.target_objects,
     )
 
     return frame_out
