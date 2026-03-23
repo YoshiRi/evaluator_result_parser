@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "evaluator-result-parser"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "Pillow",
+]
+
+[project.scripts]
+t4-batch = "t4_visualizer.batch:main"
+t4-visualize = "t4_visualizer.visualize:main"
+t4-inspect = "t4_visualizer.inspect:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["t4_visualizer*", "result_parser*"]
