@@ -282,6 +282,7 @@ def visualize_static(
 def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filename_prefix=None, target_ann_tokens=None, target_objects=None):
     """Create a figure with one subplot per camera."""
     import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
     from PIL import Image
 
     n = len(camera_channels)
