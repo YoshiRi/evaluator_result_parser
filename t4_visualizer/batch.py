@@ -1,32 +1,33 @@
 """Batch visualization pipeline for T4 dataset scenes.
 
-Reads a CSV or Parquet file whose rows each identify one scene to visualize,
-downloads the required datasets (if not already present), and produces
-camera-image + LiDAR-BEV plots for every row.
+Reads a CSV or Parquet file whose rows each identify one annotated object,
+groups them into unique frames, downloads the required datasets (with user
+confirmation), and produces camera-image + LiDAR-BEV plots for every frame.
 
 Required columns in the input file
 ------------------------------------
-- ``t4dataset_id`` : dataset identifier used to download / locate the data
-- ``uuid``         : scene / sample UUID (used as part of the output filename)
-- ``timestamp``    : target timestamp in **microseconds** (Unix time)
+- ``t4dataset_id``   : dataset identifier used to download / locate the data
+- ``scenario_name``  : name of the scene within the dataset
+- ``frame_index``    : 0-based frame index within the scene
 
 Optional columns (used when present)
 --------------------------------------
-- ``status``       : group label (e.g. "degrade", "improved") — images are placed
-                    in a sub-directory named after this value; rows without a status
-                    (or with NaN) go into an "unknown" sub-directory
-- ``cameras``      : comma-separated camera channel names to render
-- ``description``  : free-text label added to plot titles
+- ``t4dataset_name`` : human-readable dataset name (shown in download prompt)
+- ``status``         : group label (e.g. "degrade", "improved") — images are
+                       placed in a sub-directory named after this value; rows
+                       without a status (or with NaN) go into "unknown"
+- ``cameras``        : comma-separated camera channel names to render
+- ``description``    : free-text label added to plot titles
+
+One row = one annotated object.  Rows are grouped by
+``(t4dataset_id, scenario_name, frame_index)`` to produce one visualization
+per unique frame.
 
 Output structure
 -----------------
-All images for a given status are placed in the **same flat directory**:
-
-    <output_dir>/<status>/<t4dataset_id>_<uuid>_<timestamp>_cameras.png
-    <output_dir>/<status>/<t4dataset_id>_<uuid>_<timestamp>_pointcloud.png
-    <output_dir>/<status>/<t4dataset_id>_<uuid>_<timestamp>_meta.txt
-
-If no ``status`` column is present every image goes directly into <output_dir>.
+    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_cameras.png
+    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_pointcloud.png
+    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_meta.txt
 
 Storage modes
 --------------
@@ -34,24 +35,20 @@ Storage modes
                  automatically deleted when the process exits.
 ``--data-dir``   Download / read datasets from a persistent directory (default:
                  ``./t4datasets/``). Already-downloaded datasets are reused.
-``--data-dir`` can be combined with ``--keep`` to prevent deletion on exit.
 
 Usage examples
 --------------
-    # Persistent storage (default)
-    python batch_visualize.py scenes.csv --output-dir results/
+    # Interactive confirmation prompt (default)
+    python -m t4_visualizer.batch results.csv --output-dir out/
+
+    # Skip confirmation (useful in scripts)
+    python -m t4_visualizer.batch results.csv --output-dir out/ --yes
 
     # Temporary storage — data vanishes after the script finishes
-    python batch_visualize.py scenes.parquet --temp --output-dir results/
+    python -m t4_visualizer.batch results.csv --temp --output-dir out/ --yes
 
-    # Custom persistent data directory
-    python batch_visualize.py scenes.csv --data-dir /mnt/ssd/t4data --output-dir results/
-
-    # Dry-run: skip download, assume datasets are already in ./t4datasets/
-    python batch_visualize.py scenes.csv --no-download --output-dir results/
-
-    # Parallel workers
-    python batch_visualize.py scenes.csv --output-dir results/ --workers 4
+    # Custom data dir, parallel workers
+    python -m t4_visualizer.batch results.csv --data-dir /mnt/t4data -o out/ -j 4
 """
 
 from __future__ import annotations
@@ -63,22 +60,30 @@ import tempfile
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# Row dataclass
+# Frame key type  (t4dataset_id, scenario_name, frame_index)
+# ---------------------------------------------------------------------------
+
+FrameKey = Tuple[str, str, int]
+
+
+# ---------------------------------------------------------------------------
+# Frame dataclass  (one unique frame to visualize)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SceneRow:
-    """One row from the input CSV/Parquet."""
+class FrameRow:
+    """One unique (dataset, scene, frame) combination to visualize."""
     t4dataset_id: str
-    uuid: str
-    timestamp_us: int
-    status: Optional[str] = None        # e.g. "degrade", "improved"; None = no grouping
+    t4dataset_name: str          # "" when not available
+    scenario_name: str
+    frame_index: int
+    status: Optional[str] = None
     cameras: Optional[List[str]] = field(default=None)
     description: str = ""
 
@@ -89,7 +94,7 @@ class SceneRow:
 
 @dataclass
 class RowResult:
-    row: SceneRow
+    frame: FrameRow
     success: bool
     output_dir: Optional[Path] = None
     error: str = ""
@@ -99,7 +104,7 @@ class RowResult:
 # Input loading
 # ---------------------------------------------------------------------------
 
-REQUIRED_COLUMNS = {"t4dataset_id", "uuid", "timestamp"}
+REQUIRED_COLUMNS = {"t4dataset_id", "scenario_name", "frame_index"}
 
 
 def load_input(path: str) -> pd.DataFrame:
@@ -120,42 +125,94 @@ def load_input(path: str) -> pd.DataFrame:
             f"Found columns: {list(df.columns)}"
         )
 
-    df["timestamp"] = df["timestamp"].astype("int64")
+    df["frame_index"] = df["frame_index"].astype("int64")
     return df
 
 
-def df_to_rows(df: pd.DataFrame) -> List[SceneRow]:
-    rows = []
+def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
+    """Deduplicate rows into unique (t4dataset_id, scenario_name, frame_index) frames.
+
+    When multiple rows share the same frame key (i.e. different annotated
+    objects in the same frame), the first row's metadata (status, cameras,
+    description) is used for the frame.
+    """
+    seen: Dict[FrameKey, FrameRow] = {}
+
     for _, r in df.iterrows():
-        cameras = None
-        if "cameras" in df.columns and pd.notna(r.get("cameras", None)):
+        key: FrameKey = (
+            str(r["t4dataset_id"]),
+            str(r["scenario_name"]),
+            int(r["frame_index"]),
+        )
+        if key in seen:
+            continue  # already registered, skip duplicate
+
+        cameras: Optional[List[str]] = None
+        if "cameras" in df.columns and pd.notna(r.get("cameras")):
             raw = str(r["cameras"]).strip()
             if raw:
                 cameras = [c.strip() for c in raw.split(",") if c.strip()]
 
-        status = None
+        status: Optional[str] = None
         if "status" in df.columns:
-            raw_status = r.get("status", None)
+            raw_status = r.get("status")
             if pd.notna(raw_status) and str(raw_status).strip():
                 status = str(raw_status).strip()
 
-        description = str(r.get("description", "")) if "description" in df.columns else ""
-        rows.append(
-            SceneRow(
-                t4dataset_id=str(r["t4dataset_id"]),
-                uuid=str(r["uuid"]),
-                timestamp_us=int(r["timestamp"]),
-                status=status,
-                cameras=cameras,
-                description=description,
-            )
+        t4dataset_name = ""
+        if "t4dataset_name" in df.columns and pd.notna(r.get("t4dataset_name")):
+            t4dataset_name = str(r["t4dataset_name"]).strip()
+
+        description = ""
+        if "description" in df.columns and pd.notna(r.get("description")):
+            description = str(r["description"])
+
+        seen[key] = FrameRow(
+            t4dataset_id=key[0],
+            t4dataset_name=t4dataset_name,
+            scenario_name=key[1],
+            frame_index=key[2],
+            status=status,
+            cameras=cameras,
+            description=description,
         )
-    return rows
+
+    return list(seen.values())
 
 
 # ---------------------------------------------------------------------------
 # Download management
 # ---------------------------------------------------------------------------
+
+def _unique_datasets(frames: List[FrameRow]) -> List[FrameRow]:
+    """Return one representative FrameRow per unique t4dataset_id (for prompts)."""
+    seen: Dict[str, FrameRow] = {}
+    for f in frames:
+        if f.t4dataset_id not in seen:
+            seen[f.t4dataset_id] = f
+    return list(seen.values())
+
+
+def confirm_downloads(frames: List[FrameRow]) -> bool:
+    """Show datasets to be downloaded and ask the user for confirmation.
+
+    Returns True if the user approves, False otherwise.
+    """
+    unique = _unique_datasets(frames)
+    print("\nThe following datasets will be downloaded:")
+    for f in unique:
+        label = f.t4dataset_name if f.t4dataset_name else f.t4dataset_id
+        print(f"  - {label}  (id: {f.t4dataset_id})")
+    print(f"\nTotal: {len(unique)} dataset(s)\n")
+
+    try:
+        answer = input("Proceed with download? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+    return answer in ("y", "yes")
+
 
 def resolve_dataset_path(
     t4dataset_id: str,
@@ -163,7 +220,7 @@ def resolve_dataset_path(
     do_download: bool,
 ) -> Path:
     """Return the local path to a dataset, downloading it first if needed."""
-    from t4_visualizer.downloader import download_dataset, dataset_is_cached, DownloadError
+    from t4_visualizer.downloader import download_dataset, DownloadError
 
     if do_download:
         return download_dataset(t4dataset_id, data_dir)
@@ -177,42 +234,30 @@ def resolve_dataset_path(
 
 
 # ---------------------------------------------------------------------------
-# Single-row visualization
+# Single-frame visualization
 # ---------------------------------------------------------------------------
 
 def _status_dir(output_root: Path, status: Optional[str], has_status_column: bool) -> Path:
-    """Return the output directory for a given status value.
-
-    - If the input has no ``status`` column → images go directly in output_root.
-    - If it has a status column but the value is blank/NaN → "unknown" sub-dir.
-    - Otherwise → sub-dir named after the status value.
-    """
     if not has_status_column:
         return output_root
     return output_root / (status if status else "unknown")
 
 
-def _filename_prefix(row: SceneRow) -> str:
-    """Build the flat filename prefix: <t4dataset_id>_<uuid>_<timestamp_us>."""
-    # Sanitize components so they are safe as filename parts
+def _filename_prefix(frame: FrameRow) -> str:
+    """Build flat filename prefix: <t4dataset_id>_<scenario_name>_f<frame_index>."""
     safe = lambda s: str(s).replace("/", "-").replace(" ", "_")
-    return f"{safe(row.t4dataset_id)}_{safe(row.uuid)}_{row.timestamp_us}"
+    return f"{safe(frame.t4dataset_id)}_{safe(frame.scenario_name)}_f{frame.frame_index:06d}"
 
 
-def visualize_row(
-    row: SceneRow,
+def visualize_frame(
+    frame: FrameRow,
     dataset_path: Path,
     output_root: Path,
     show_annotations: bool = True,
     version: Optional[str] = None,
     has_status_column: bool = False,
 ) -> Path:
-    """Visualize one scene row. Returns the output directory used.
-
-    All files for this row are written into a single flat directory
-    (``<output_root>/<status>/``) with a shared filename prefix
-    ``<t4dataset_id>_<uuid>_<timestamp_us>`` so they sort together.
-    """
+    """Visualize one frame. Returns the output directory used."""
     try:
         from t4_devkit import Tier4
     except ImportError:
@@ -222,61 +267,54 @@ def visualize_row(
         )
 
     from t4_visualizer.visualize import (
-        find_closest_sample,
+        find_sample_by_scene_and_index,
         list_camera_channels,
         list_lidar_channels,
         visualize_static,
     )
 
-    # Flat output directory: <output_root>/[<status>/]
-    row_out = _status_dir(output_root, row.status, has_status_column)
-    row_out.mkdir(parents=True, exist_ok=True)
+    frame_out = _status_dir(output_root, frame.status, has_status_column)
+    frame_out.mkdir(parents=True, exist_ok=True)
+    prefix = _filename_prefix(frame)
 
-    prefix = _filename_prefix(row)
-
-    # Load dataset
     kwargs = {}
     if version:
         kwargs["version"] = version
     t4 = Tier4(str(dataset_path), **kwargs)
 
-    # Find closest sample
-    sample = find_closest_sample(t4, row.timestamp_us)
-    if sample is None:
-        raise RuntimeError(f"No samples found in dataset: {dataset_path}")
+    sample = find_sample_by_scene_and_index(t4, frame.scenario_name, frame.frame_index)
 
-    delta_ms = abs(sample.timestamp - row.timestamp_us) / 1e3
     print(
-        f"  [{row.uuid}] sample={sample.token} "
-        f"Δ={delta_ms:.1f} ms  ts={sample.timestamp}"
+        f"  [{frame.scenario_name}] frame={frame.frame_index} "
+        f"sample={sample.token}  ts={sample.timestamp}"
     )
 
-    # Write metadata sidecar (same prefix, .txt extension)
-    meta_path = row_out / f"{prefix}_meta.txt"
-    with open(meta_path, "w") as f:
-        f.write(
-            f"t4dataset_id : {row.t4dataset_id}\n"
-            f"uuid         : {row.uuid}\n"
-            f"status       : {row.status}\n"
-            f"target_ts_us : {row.timestamp_us}\n"
-            f"sample_token : {sample.token}\n"
-            f"sample_ts_us : {sample.timestamp}\n"
-            f"delta_ms     : {delta_ms:.3f}\n"
-            f"description  : {row.description}\n"
-            f"cameras      : {list_camera_channels(t4, sample)}\n"
-            f"lidars       : {list_lidar_channels(t4, sample)}\n"
+    # Write metadata sidecar
+    meta_path = frame_out / f"{prefix}_meta.txt"
+    with open(meta_path, "w") as fh:
+        fh.write(
+            f"t4dataset_id  : {frame.t4dataset_id}\n"
+            f"t4dataset_name: {frame.t4dataset_name}\n"
+            f"scenario_name : {frame.scenario_name}\n"
+            f"frame_index   : {frame.frame_index}\n"
+            f"status        : {frame.status}\n"
+            f"sample_token  : {sample.token}\n"
+            f"sample_ts_us  : {sample.timestamp}\n"
+            f"description   : {frame.description}\n"
+            f"cameras       : {list_camera_channels(t4, sample)}\n"
+            f"lidars        : {list_lidar_channels(t4, sample)}\n"
         )
 
     visualize_static(
         t4,
         sample,
-        cameras=row.cameras,
+        cameras=frame.cameras,
         show_annotations=show_annotations,
-        save_dir=str(row_out),
+        save_dir=str(frame_out),
         filename_prefix=prefix,
     )
 
-    return row_out
+    return frame_out
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +325,10 @@ def visualize_row(
 class BatchConfig:
     input_path: str
     output_dir: Path
-    data_dir: Optional[Path]       # None = use temp
+    data_dir: Optional[Path]
     use_temp: bool
     do_download: bool
+    yes: bool                  # skip confirmation prompt
     show_annotations: bool
     version: Optional[str]
     workers: int
@@ -297,22 +336,36 @@ class BatchConfig:
 
 
 def run_batch(cfg: BatchConfig) -> List[RowResult]:
-    """Main batch pipeline. Returns list of per-row results."""
-    # Load input
+    """Main batch pipeline. Returns list of per-frame results."""
     print(f"Loading input: {cfg.input_path}")
     df = load_input(cfg.input_path)
     has_status_column = "status" in df.columns
-    rows = df_to_rows(df)
-    print(f"  {len(rows)} rows found.")
+    frames = df_to_frames(df)
+    print(f"  {len(df)} rows → {len(frames)} unique frame(s) to visualize.")
     if has_status_column:
-        status_counts = df["status"].fillna("unknown").value_counts().to_dict()
-        print(f"  Status groups: {status_counts}")
+        counts = (
+            df["status"].fillna("unknown").value_counts().to_dict()
+        )
+        print(f"  Status groups: {counts}")
 
-    # Unique dataset IDs
-    unique_ids = list(dict.fromkeys(r.t4dataset_id for r in rows))
-    print(f"  {len(unique_ids)} unique t4dataset_id(s): {unique_ids}")
+    unique_ids = list(dict.fromkeys(f.t4dataset_id for f in frames))
+    print(f"  {len(unique_ids)} unique dataset(s): {unique_ids}")
 
+    # ----------------------------------------------------------------
+    # User confirmation before downloading
+    # ----------------------------------------------------------------
+    if cfg.do_download:
+        if cfg.yes:
+            print("  --yes flag set, skipping confirmation.")
+        else:
+            approved = confirm_downloads(frames)
+            if not approved:
+                print("Download cancelled by user.")
+                sys.exit(0)
+
+    # ----------------------------------------------------------------
     # Setup data directory
+    # ----------------------------------------------------------------
     _tmp_ctx = None
     if cfg.use_temp:
         _tmp_ctx = tempfile.TemporaryDirectory(prefix="t4batch_")
@@ -327,7 +380,7 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
 
     try:
         # Download all required datasets first (sequential to avoid conflicts)
-        dataset_paths: dict[str, Path] = {}
+        dataset_paths: Dict[str, Path] = {}
         for did in unique_ids:
             try:
                 path = resolve_dataset_path(did, data_dir, cfg.do_download)
@@ -335,55 +388,53 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
                 print(f"  Dataset ready: {did} → {path}")
             except Exception as e:
                 print(f"  ERROR downloading {did}: {e}")
-                # Mark all rows for this dataset as failed
-                for row in rows:
-                    if row.t4dataset_id == did:
-                        results.append(RowResult(row=row, success=False, error=str(e)))
+                for fr in frames:
+                    if fr.t4dataset_id == did:
+                        results.append(RowResult(frame=fr, success=False, error=str(e)))
                 if cfg.fail_fast:
                     raise
 
-        # Filter rows whose dataset downloaded successfully
-        ok_rows = [r for r in rows if r.t4dataset_id in dataset_paths]
-
+        ok_frames = [f for f in frames if f.t4dataset_id in dataset_paths]
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-        def _process(row: SceneRow) -> RowResult:
-            dataset_path = dataset_paths[row.t4dataset_id]
+        def _process(frame: FrameRow) -> RowResult:
+            dataset_path = dataset_paths[frame.t4dataset_id]
             try:
-                out = visualize_row(
-                    row,
+                out = visualize_frame(
+                    frame,
                     dataset_path,
                     cfg.output_dir,
                     show_annotations=cfg.show_annotations,
                     version=cfg.version,
                     has_status_column=has_status_column,
                 )
-                return RowResult(row=row, success=True, output_dir=out)
+                return RowResult(frame=frame, success=True, output_dir=out)
             except Exception as e:
                 tb = traceback.format_exc()
-                print(f"  ERROR [{row.uuid} / {row.timestamp_us}]: {e}\n{tb}")
-                return RowResult(row=row, success=False, error=str(e))
+                print(f"  ERROR [{frame.scenario_name} / frame {frame.frame_index}]: {e}\n{tb}")
+                return RowResult(frame=frame, success=False, error=str(e))
 
         if cfg.workers <= 1:
-            for row in ok_rows:
+            for frame in ok_frames:
                 print(
-                    f"\n--- Processing [{row.t4dataset_id}] uuid={row.uuid} "
-                    f"ts={row.timestamp_us} ---"
+                    f"\n--- [{frame.t4dataset_id}] {frame.scenario_name} "
+                    f"frame={frame.frame_index} ---"
                 )
-                result = _process(row)
+                result = _process(frame)
                 results.append(result)
                 if not result.success and cfg.fail_fast:
                     raise RuntimeError(result.error)
         else:
-            print(f"\nProcessing {len(ok_rows)} rows with {cfg.workers} parallel workers...")
+            print(f"\nProcessing {len(ok_frames)} frame(s) with {cfg.workers} workers...")
             with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.workers) as pool:
-                futures = {pool.submit(_process, row): row for row in ok_rows}
+                futures = {pool.submit(_process, frame): frame for frame in ok_frames}
                 for future in concurrent.futures.as_completed(futures):
                     result = future.result()
                     results.append(result)
                     status = "OK" if result.success else "FAIL"
                     print(
-                        f"  [{status}] {result.row.uuid} / {result.row.timestamp_us}"
+                        f"  [{status}] {result.frame.scenario_name} "
+                        f"frame={result.frame.frame_index}"
                         + (f" → {result.output_dir}" if result.success else f": {result.error}")
                     )
                     if not result.success and cfg.fail_fast:
@@ -412,22 +463,25 @@ def print_summary(results: List[RowResult], output_dir: Path) -> None:
     print(f"{'='*60}")
 
     if fail:
-        print("\nFailed rows:")
+        print("\nFailed frames:")
         for r in fail:
-            print(f"  t4dataset_id={r.row.t4dataset_id}  uuid={r.row.uuid}  "
-                  f"ts={r.row.timestamp_us}\n    Error: {r.error}")
+            print(
+                f"  t4dataset_id={r.frame.t4dataset_id}  "
+                f"scenario={r.frame.scenario_name}  "
+                f"frame={r.frame.frame_index}\n    Error: {r.error}"
+            )
 
-    # Write CSV summary
     summary_path = output_dir / "batch_summary.csv"
     summary_df = pd.DataFrame([
         {
-            "t4dataset_id": r.row.t4dataset_id,
-            "uuid": r.row.uuid,
-            "timestamp_us": r.row.timestamp_us,
-            "status": r.row.status,
+            "t4dataset_id": r.frame.t4dataset_id,
+            "t4dataset_name": r.frame.t4dataset_name,
+            "scenario_name": r.frame.scenario_name,
+            "frame_index": r.frame.frame_index,
+            "status": r.frame.status,
             "success": r.success,
             "output_dir": str(r.output_dir) if r.output_dir else "",
-            "filename_prefix": _filename_prefix(r.row) if r.success else "",
+            "filename_prefix": _filename_prefix(r.frame) if r.success else "",
             "error": r.error,
         }
         for r in results
@@ -444,8 +498,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Batch T4 dataset visualization pipeline.\n"
-            "Reads a CSV/Parquet with columns [t4dataset_id, uuid, timestamp] "
-            "and produces camera + LiDAR plots for each row."
+            "Reads a CSV/Parquet with columns "
+            "[t4dataset_id, scenario_name, frame_index] "
+            "and produces camera + LiDAR plots for each unique frame."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -453,7 +508,7 @@ def parse_args():
 
     parser.add_argument(
         "input",
-        help="CSV or Parquet file with columns: t4dataset_id, uuid, timestamp.",
+        help="CSV or Parquet file with columns: t4dataset_id, scenario_name, frame_index.",
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -461,17 +516,19 @@ def parse_args():
         metavar="DIR",
         help="Root directory for visualization outputs (default: ./batch_output/).",
     )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        default=False,
+        help="Skip the download confirmation prompt (non-interactive / scripted use).",
+    )
 
-    # Storage mode (mutually exclusive)
     storage = parser.add_mutually_exclusive_group()
     storage.add_argument(
         "--temp",
         action="store_true",
         default=False,
-        help=(
-            "Download datasets into a temporary directory that is deleted on exit. "
-            "Useful for CI or one-shot jobs where storage is limited."
-        ),
+        help="Download into a temporary directory that is deleted on exit.",
     )
     storage.add_argument(
         "--data-dir",
@@ -487,10 +544,7 @@ def parse_args():
         "--no-download",
         action="store_true",
         default=False,
-        help=(
-            "Skip downloading; assume datasets already exist under --data-dir. "
-            "Fails if a required dataset is missing."
-        ),
+        help="Skip downloading; assume datasets already exist under --data-dir.",
     )
     parser.add_argument(
         "--no-annotations",
@@ -506,7 +560,7 @@ def parse_args():
         help="Dataset annotation version directory name (default: auto-detect).",
     )
     parser.add_argument(
-        "--workers",
+        "--workers", "-j",
         type=int,
         default=1,
         metavar="N",
@@ -531,6 +585,7 @@ def main():
         data_dir=Path(args.data_dir) if args.data_dir else None,
         use_temp=args.temp,
         do_download=not args.no_download,
+        yes=args.yes,
         show_annotations=args.show_annotations,
         version=args.version,
         workers=args.workers,

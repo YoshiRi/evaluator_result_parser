@@ -58,6 +58,43 @@ def find_closest_sample(t4, timestamp_us: int):
     return best
 
 
+def find_sample_by_scene_and_index(t4, scene_name: str, frame_index: int):
+    """Return the frame_index-th sample in the named scene.
+
+    Walks the linked list of samples starting from scene.first_sample_token.
+
+    Args:
+        t4: Tier4 instance already loaded with the dataset.
+        scene_name: Value of the ``name`` field in the scene table.
+        frame_index: 0-based index of the frame within the scene.
+
+    Returns:
+        The Sample object at position *frame_index*.
+
+    Raises:
+        ValueError: If no scene with *scene_name* is found.
+        IndexError: If *frame_index* exceeds the number of samples in the scene.
+    """
+    scene = next((s for s in t4.scene if s.name == scene_name), None)
+    if scene is None:
+        available = [s.name for s in t4.scene]
+        raise ValueError(
+            f"Scene '{scene_name}' not found in dataset.\n"
+            f"Available scenes: {available}"
+        )
+
+    token = scene.first_sample_token
+    for i in range(frame_index):
+        sample = t4.get("sample", token)
+        if not sample.next:
+            raise IndexError(
+                f"frame_index {frame_index} is out of range for scene '{scene_name}' "
+                f"(scene contains only {i + 1} sample(s))."
+            )
+        token = sample.next
+    return t4.get("sample", token)
+
+
 def list_camera_channels(t4, sample) -> List[str]:
     """Return camera channel names available for the given sample."""
     channels = []
