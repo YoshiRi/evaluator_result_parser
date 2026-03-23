@@ -163,7 +163,7 @@ def resolve_dataset_path(
     do_download: bool,
 ) -> Path:
     """Return the local path to a dataset, downloading it first if needed."""
-    from downloader import download_dataset, dataset_is_cached, DownloadError
+    from t4_visualizer.downloader import download_dataset, dataset_is_cached, DownloadError
 
     if do_download:
         return download_dataset(t4dataset_id, data_dir)
@@ -221,7 +221,7 @@ def visualize_row(
             "Install with: pip install git+https://github.com/tier4/t4-devkit.git"
         )
 
-    from visualize_by_uuid import (
+    from t4_visualizer.visualize import (
         find_closest_sample,
         list_camera_channels,
         list_lidar_channels,
