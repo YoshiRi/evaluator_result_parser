@@ -350,9 +350,18 @@ def _load_pointcloud(data_path: str) -> Optional[np.ndarray]:
 
     suffix = path.suffix.lower()
     if suffix == ".bin" or data_path.endswith(".pcd.bin"):
-        # Binary float32 format (KITTI-style): x, y, z, intensity
-        pts = np.fromfile(data_path, dtype=np.float32).reshape(-1, 4)
-        return pts
+        # Binary float32 format: x, y, z, intensity[, ring, time, ...]
+        raw = np.fromfile(data_path, dtype=np.float32)
+        for ncols in (4, 5, 6, 3):
+            if raw.size % ncols == 0:
+                pts = raw.reshape(-1, ncols)
+                # Always return Nx4 (pad intensity with zeros if only 3 cols)
+                if ncols >= 4:
+                    return pts[:, :4]
+                else:
+                    return np.column_stack([pts, np.zeros(len(pts), dtype=np.float32)])
+        print(f"  WARNING: Cannot determine point cloud stride for size {raw.size}: {data_path}")
+        return None
     elif suffix == ".pcd":
         return _load_pcd(data_path)
     else:
