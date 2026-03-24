@@ -18,6 +18,9 @@ Optional columns (used when present)
                        without a status (or with NaN) go into "unknown"
 - ``cameras``        : comma-separated camera channel names to render
 - ``description``    : free-text label added to plot titles
+- ``label``          : string label for the target object (e.g. "car", "pedestrian");
+                       when present, it is prepended to the output filename so that
+                       results can be distinguished at a glance
 
 One row = one annotated object.  Rows are grouped by
 ``(t4dataset_id, scenario_name, frame_index)`` to produce one visualization
@@ -25,9 +28,11 @@ per unique frame.
 
 Output structure
 -----------------
-    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_cameras.png
-    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_pointcloud.png
-    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_meta.txt
+    <output_dir>/<status>/<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_cameras.png
+    <output_dir>/<status>/<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_pointcloud.png
+    <output_dir>/<status>/<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_meta.txt
+
+``<label>_`` is omitted when the ``label`` column is absent or empty.
 
 Storage modes
 --------------
@@ -277,9 +282,20 @@ def _status_dir(output_root: Path, status: Optional[str], has_status_column: boo
 
 
 def _filename_prefix(frame: FrameRow) -> str:
-    """Build flat filename prefix: <t4dataset_id>_<scenario_name>_f<frame_index>."""
+    """Build flat filename prefix.
+
+    Format: <label>_<t4dataset_id>_<scenario_name>_f<frame_index>
+    The <label>_ part is omitted when no target object carries a label.
+    """
     safe = lambda s: str(s).replace("/", "-").replace(" ", "_")
-    return f"{safe(frame.t4dataset_id)}_{safe(frame.scenario_name)}_f{frame.frame_index:06d}"
+    base = f"{safe(frame.t4dataset_id)}_{safe(frame.scenario_name)}_f{frame.frame_index:06d}"
+    obj_label = next(
+        (obj.label for obj in frame.target_objects if obj.label),
+        "",
+    )
+    if obj_label:
+        return f"{safe(obj_label)}_{base}"
+    return base
 
 
 def visualize_frame(
