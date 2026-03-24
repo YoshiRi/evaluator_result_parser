@@ -541,18 +541,22 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
         ax.set_ylim(view_ylim)
 
 
-def _find_largest_roi_camera(t4, sample, camera_channels, target_objects):
-    """Return (channel, token, roi, img_w, img_h) for the camera+object pair
-    whose projected BBOX ROI has the best score.  Returns None if no ROI is
-    visible in any camera.
+def _group_objects_by_camera(t4, sample, camera_channels, target_objects):
+    """Map each target object to its best-scoring camera, then group by camera.
 
-    Scoring: ROIs with visibility >= 0.5 (at least half of the projected BBOX
-    is within the image) are preferred over those that are mostly out of frame.
-    Within the same visibility tier, the largest clipped area wins.
+    For each object the best camera is chosen with the same (tier, area) score
+    used previously in _find_largest_roi_camera.
+
+    Returns a list of (channel, token, obj_roi_pairs, img_w, img_h) where
+    obj_roi_pairs is [(obj, roi), ...] for all objects whose best camera is
+    this channel.  Objects that are not visible in any camera are omitted.
+    The list is ordered by descending total clipped area so the "most
+    interesting" camera comes first.
     """
     from PIL import Image as PILImage
 
-    best = None
+    # Cache (token, img_w, img_h) per channel to avoid re-opening images.
+    cam_info: dict = {}
     for channel in camera_channels:
         token = sample.data.get(channel)
         if token is None:
@@ -561,21 +565,39 @@ def _find_largest_roi_camera(t4, sample, camera_channels, target_objects):
             data_path, _, _ = t4.get_sample_data(token, as_3d=False)
             with PILImage.open(data_path) as img:
                 img_w, img_h = img.size
+            cam_info[channel] = (token, img_w, img_h)
         except Exception:
             continue
-        for obj in target_objects:
+
+    # For each object find the best (channel, roi).
+    obj_best: dict = {}  # obj_idx -> (channel, roi, tier, area)
+    for obj_idx, obj in enumerate(target_objects):
+        for channel, (token, img_w, img_h) in cam_info.items():
             roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
             if roi is None:
                 continue
             u_min, v_min, u_max, v_max, visibility = roi
             area = (u_max - u_min) * (v_max - v_min)
             tier = 1 if visibility >= _VISIBILITY_TIER_THRESHOLD else 0
-            if best is None or (tier, area) > (best[3], best[4]):
-                best = (channel, token, roi, tier, area, img_w, img_h)
-    if best is None:
-        return None
-    channel, token, roi, _, _, img_w, img_h = best
-    return channel, token, roi, img_w, img_h
+            prev = obj_best.get(obj_idx)
+            if prev is None or (tier, area) > (prev[2], prev[3]):
+                obj_best[obj_idx] = (channel, roi, tier, area)
+
+    # Group objects by their best camera.
+    groups: dict = {}  # channel -> [(obj, roi), ...]
+    for obj_idx, (channel, roi, _, _) in obj_best.items():
+        groups.setdefault(channel, []).append((target_objects[obj_idx], roi))
+
+    # Build result sorted by total clipped area descending.
+    result = []
+    for channel, obj_roi_pairs in groups.items():
+        token, img_w, img_h = cam_info[channel]
+        total_area = sum(
+            (r[2] - r[0]) * (r[3] - r[1]) for _, r in obj_roi_pairs
+        )
+        result.append((channel, token, obj_roi_pairs, img_w, img_h, total_area))
+    result.sort(key=lambda x: x[5], reverse=True)
+    return [(ch, tok, pairs, w, h) for ch, tok, pairs, w, h, _ in result]
 
 
 def _compute_crop_limits(roi, img_w, img_h, padding: int, min_size: int):
@@ -624,65 +646,73 @@ def _plot_combined(t4, sample, camera_channels, lidar_channel, show_annotations,
     ts_us = sample.timestamp
 
     # ------------------------------------------------------------------
-    # Crop-camera mode: [cropped camera | BEV]
+    # Crop-camera mode: one [cropped camera | BEV] figure per camera group
     # ------------------------------------------------------------------
     if crop_cameras and target_objects:
-        best = _find_largest_roi_camera(
+        cam_groups = _group_objects_by_camera(
             t4, sample, camera_channels, target_objects
         )
-        if best is not None:
-            channel, token, roi, img_w, img_h = best
-            x0, x1, y0, y1 = _compute_crop_limits(
-                roi, img_w, img_h, crop_padding, crop_min_size
-            )
-            crop_w = x1 - x0
-            crop_h = y1 - y0
-            # Aspect ratio of crop determines figure proportions
-            bev_size = 7.0          # inches for the square BEV panel
-            cam_w_in = bev_size * (crop_w / crop_h)  # keep crop aspect ratio
-            fig_w = cam_w_in + bev_size + 0.3
-            fig_h = bev_size + 0.4  # +0.4 for suptitle
-
-            fig = plt.figure(figsize=(fig_w, fig_h))
-            gs = gridspec.GridSpec(
-                1, 2, figure=fig,
-                width_ratios=[cam_w_in, bev_size],
-                hspace=0.05, wspace=0.08,
-            )
-            cam_ax = fig.add_subplot(gs[0, 0])
-            bev_ax = fig.add_subplot(gs[0, 1])
-
-            # Render full camera image + all overlays, then zoom
-            _fill_camera_axes(
-                t4, sample, [channel], show_annotations,
-                [cam_ax], target_ann_tokens, target_objects,
-            )
-            # Zoom to crop region (y-axis is inverted for images)
-            cam_ax.set_xlim(x0, x1)
-            cam_ax.set_ylim(y1, y0)
-            cam_ax.set_title(f"{channel} [crop]", fontsize=9)
-
-            if has_lidar:
-                _fill_bev_ax(t4, sample, lidar_channel, show_annotations,
-                             bev_ax, target_ann_tokens, target_objects)
-
-            fig.suptitle(
-                f"timestamp: {ts_us} µs  ({ts_us / 1e6:.3f} s)    "
-                f"token: {sample.token}",
-                fontsize=9,
-            )
-            fig.tight_layout()
-
+        if cam_groups:
+            prefix = filename_prefix if filename_prefix else str(ts_us)
             if save_dir:
                 Path(save_dir).mkdir(parents=True, exist_ok=True)
-                prefix = filename_prefix if filename_prefix else str(ts_us)
-                out = Path(save_dir) / f"{prefix}_visualization_crop.png"
-                fig.savefig(out, dpi=150, bbox_inches="tight")
-                print(f"  Saved: {out}")
-            plt.close(fig)
+
+            for channel, token, obj_roi_pairs, img_w, img_h in cam_groups:
+                # Merge all object ROIs for this camera into one crop region.
+                merged_roi = (
+                    min(r[0] for _, r in obj_roi_pairs),
+                    min(r[1] for _, r in obj_roi_pairs),
+                    max(r[2] for _, r in obj_roi_pairs),
+                    max(r[3] for _, r in obj_roi_pairs),
+                )
+                x0, x1, y0, y1 = _compute_crop_limits(
+                    merged_roi, img_w, img_h, crop_padding, crop_min_size
+                )
+                crop_w = x1 - x0
+                crop_h = y1 - y0
+
+                bev_size = 7.0
+                cam_w_in = bev_size * (crop_w / crop_h)
+                fig_w = cam_w_in + bev_size + 0.3
+                fig_h = bev_size + 0.4
+
+                fig = plt.figure(figsize=(fig_w, fig_h))
+                gs = gridspec.GridSpec(
+                    1, 2, figure=fig,
+                    width_ratios=[cam_w_in, bev_size],
+                    hspace=0.05, wspace=0.08,
+                )
+                cam_ax = fig.add_subplot(gs[0, 0])
+                bev_ax = fig.add_subplot(gs[0, 1])
+
+                _fill_camera_axes(
+                    t4, sample, [channel], show_annotations,
+                    [cam_ax], target_ann_tokens,
+                    [obj for obj, _ in obj_roi_pairs],
+                )
+                cam_ax.set_xlim(x0, x1)
+                cam_ax.set_ylim(y1, y0)
+                cam_ax.set_title(f"{channel} [crop]", fontsize=9)
+
+                if has_lidar:
+                    _fill_bev_ax(t4, sample, lidar_channel, show_annotations,
+                                 bev_ax, target_ann_tokens, target_objects)
+
+                fig.suptitle(
+                    f"timestamp: {ts_us} µs  ({ts_us / 1e6:.3f} s)    "
+                    f"token: {sample.token}",
+                    fontsize=9,
+                )
+                fig.tight_layout()
+
+                if save_dir:
+                    out = Path(save_dir) / f"{prefix}_{channel}_visualization_crop.png"
+                    fig.savefig(out, dpi=150, bbox_inches="tight")
+                    print(f"  Saved: {out}")
+                plt.close(fig)
             return
 
-        # No ROI found — fall through to standard layout with a warning
+        # No ROI found in any camera — fall through to standard layout.
         print("  WARNING: crop_cameras=True but no ROI visible; "
               "falling back to full camera grid.")
 

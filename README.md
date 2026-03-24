@@ -210,17 +210,28 @@ python t4_visualizer/batch.py scenes.csv --output-dir results/ --workers 4
 #### 出力構造
 
 `status` 列がある場合、ステータスごとにサブフォルダへ分類されます。
-各フォルダ内はフラットで、ファイル名に `<t4dataset_id>_<uuid>_<timestamp>` が付きます。
+
+通常モード（`--no-crop`）の出力ファイル名:
+```
+<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_visualization.png
+```
+
+crop モード（デフォルト）では、物体ごとに最良カメラを選び**カメラ別に 1 枚**生成します。
+異なるカメラに写る物体は別ファイルになります:
+```
+<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_<CHANNEL>_visualization_crop.png
+```
 
 ```
 results/
-├── batch_summary.csv                                              # 全行の成否・エラー一覧
+├── batch_summary.csv
 ├── degrade/
-│   ├── car_dataset-abc_scene-001_f000000_cameras.png
-│   ├── car_dataset-abc_scene-001_f000000_pointcloud.png
-│   └── car_dataset-abc_scene-001_f000000_meta.txt
+│   ├── car_dataset-abc_scene-001_f000000_CAM_FRONT_visualization_crop.png
+│   ├── car_dataset-abc_scene-001_f000000_CAM_BACK_visualization_crop.png  ← 別カメラの物体
+│   ├── car_dataset-abc_scene-001_f000000_meta.txt
+│   └── car_dataset-abc_scene-001_f000000_pointcloud.png
 └── improved/
-    ├── pedestrian_dataset-abc_scene-001_f000005_cameras.png
+    ├── pedestrian_dataset-abc_scene-001_f000005_CAM_FRONT_visualization_crop.png
     └── ...
 ```
 
