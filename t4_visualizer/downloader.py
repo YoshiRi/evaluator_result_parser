@@ -5,7 +5,7 @@ Default download command
     webauto data annotation-dataset pull \\
         --project-id <project_id> \\
         --annotation-dataset-id <t4dataset_id> \\
-        --output <dest_dir>/<t4dataset_id>
+        --asset-dir <dest_dir>/<t4dataset_id>
 
 Configuration (in order of precedence)
 ---------------------------------------
@@ -14,7 +14,7 @@ Configuration (in order of precedence)
        T4_DOWNLOAD_CMD="webauto data annotation-dataset pull \\
            --project-id my_proj \\
            --annotation-dataset-id {t4dataset_id} \\
-           --output {dataset_path}"
+           --asset-dir {dataset_path}"
 
    Placeholders: ``{t4dataset_id}``, ``{dest_dir}``, ``{dataset_path}``
    (``{dataset_path}`` == ``{dest_dir}/{t4dataset_id}``)
@@ -447,7 +447,7 @@ def _download_impl(t4dataset_id: str, dest_dir: Path, dataset_path: Path) -> Non
         "webauto", "data", "annotation-dataset", "pull",
         "--project-id", WEBAUTO_PROJECT_ID,
         "--annotation-dataset-id", t4dataset_id,
-        "--output", str(dataset_path),
+        "--asset-dir", str(dataset_path),
     ]
     print(f"  [downloader] Running: {' '.join(cmd)}")
     result = subprocess.run(cmd)
