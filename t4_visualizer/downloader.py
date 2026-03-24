@@ -440,14 +440,20 @@ def _run_cmd_template(
 def _download_impl(t4dataset_id: str, dest_dir: Path, dataset_path: Path) -> None:
     """Download via ``webauto data annotation-dataset pull``.
 
-    Downloads the dataset directly into ``dataset_path``
-    (= ``dest_dir / t4dataset_id``) so that the expected path check passes.
+    Passes ``dest_dir`` (not ``dest_dir/t4dataset_id``) as ``--asset-dir`` so
+    that webauto places the dataset at::
+
+        dest_dir/annotation_dataset/<t4dataset_id>/<version>/
+
+    After the download completes the versioned directory is moved to
+    ``dataset_path`` (= ``dest_dir / t4dataset_id``) so that the rest of the
+    cache logic continues to work unchanged.
     """
     cmd = [
         "webauto", "data", "annotation-dataset", "pull",
         "--project-id", WEBAUTO_PROJECT_ID,
         "--annotation-dataset-id", t4dataset_id,
-        "--asset-dir", str(dataset_path),
+        "--asset-dir", str(dest_dir),
     ]
     print(f"  [downloader] Running: {' '.join(cmd)}")
     result = subprocess.run(cmd)
@@ -457,4 +463,24 @@ def _download_impl(t4dataset_id: str, dest_dir: Path, dataset_path: Path) -> Non
             f"Command: {' '.join(cmd)}\n"
             "Check that `webauto` is installed and you are logged in."
         )
+
+    # webauto writes to dest_dir/annotation_dataset/<uuid>/<version>/
+    # Move the versioned directory to dataset_path so callers find it there.
+    ann_uuid_dir = dest_dir / "annotation_dataset" / t4dataset_id
+    if ann_uuid_dir.exists():
+        versions = sorted(p for p in ann_uuid_dir.iterdir() if p.is_dir())
+        if versions:
+            downloaded = versions[-1]  # use latest version directory
+            print(f"  [downloader] Moving {downloaded} → {dataset_path}")
+            shutil.move(str(downloaded), str(dataset_path))
+            # Remove now-empty annotation_dataset/<uuid> and annotation_dataset/
+            # dirs (best-effort; ignore if non-empty).
+            try:
+                ann_uuid_dir.rmdir()
+            except OSError:
+                pass
+            try:
+                (dest_dir / "annotation_dataset").rmdir()
+            except OSError:
+                pass
 
