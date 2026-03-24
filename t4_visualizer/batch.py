@@ -243,18 +243,26 @@ def resolve_dataset_path(
     t4dataset_id: str,
     data_dir: Path,
     do_download: bool,
+    cache_limit: int = 0,
 ) -> Path:
-    """Return the local path to a dataset, downloading it first if needed."""
-    from t4_visualizer.downloader import download_dataset, DownloadError
+    """Return the local path to a dataset, downloading it first if needed.
+
+    When *cache_limit* > 0 a :class:`DatasetCache` is used so that the
+    least-recently-used datasets are evicted once the limit is reached.
+    """
+    from t4_visualizer.downloader import DatasetCache, DownloadError, dataset_is_cached
 
     if do_download:
-        return download_dataset(t4dataset_id, data_dir)
+        cache = DatasetCache(data_dir, max_cached=cache_limit)
+        return cache.ensure(t4dataset_id)
     else:
         path = data_dir / t4dataset_id
         if not path.exists():
             raise FileNotFoundError(
                 f"Dataset not found at {path} and --no-download was specified."
             )
+        # Still update the access timestamp so the cache knows it was used
+        DatasetCache(data_dir, max_cached=0).touch(t4dataset_id)
         return path
 
 
@@ -368,6 +376,7 @@ class BatchConfig:
     crop_cameras: bool = False
     crop_padding: int = 40
     crop_min_size: int = 300
+    cache_limit: int = 10
 
 
 def run_batch(cfg: BatchConfig) -> List[RowResult]:
@@ -418,7 +427,8 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
         dataset_paths: Dict[str, Path] = {}
         for did in unique_ids:
             try:
-                path = resolve_dataset_path(did, data_dir, cfg.do_download)
+                path = resolve_dataset_path(did, data_dir, cfg.do_download,
+                                            cache_limit=cfg.cache_limit)
                 dataset_paths[did] = path
                 print(f"  Dataset ready: {did} → {path}")
             except Exception as e:
@@ -611,6 +621,17 @@ def parse_args():
         help="Abort the batch on the first error instead of continuing.",
     )
     parser.add_argument(
+        "--cache-limit",
+        type=int,
+        default=10,
+        metavar="N",
+        dest="cache_limit",
+        help=(
+            "Maximum number of datasets to keep on disk (LRU eviction). "
+            "0 disables eviction (default: 10)."
+        ),
+    )
+    parser.add_argument(
         "--crop-view",
         action="store_true",
         default=False,
@@ -656,6 +677,7 @@ def main():
         crop_cameras=args.crop_cameras,
         crop_padding=args.crop_padding,
         crop_min_size=args.crop_min_size,
+        cache_limit=args.cache_limit,
     )
 
     results = run_batch(cfg)
