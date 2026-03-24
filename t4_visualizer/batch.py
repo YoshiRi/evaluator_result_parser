@@ -281,6 +281,9 @@ def visualize_frame(
     show_annotations: bool = True,
     version: Optional[str] = None,
     has_status_column: bool = False,
+    crop_cameras: bool = False,
+    crop_padding: int = 40,
+    crop_min_size: int = 300,
 ) -> Path:
     """Visualize one frame. Returns the output directory used."""
     try:
@@ -338,6 +341,9 @@ def visualize_frame(
         save_dir=str(frame_out),
         filename_prefix=prefix,
         target_objects=frame.target_objects,
+        crop_cameras=crop_cameras,
+        crop_padding=crop_padding,
+        crop_min_size=crop_min_size,
     )
 
     return frame_out
@@ -359,6 +365,9 @@ class BatchConfig:
     version: Optional[str]
     workers: int
     fail_fast: bool
+    crop_cameras: bool = False
+    crop_padding: int = 40
+    crop_min_size: int = 300
 
 
 def run_batch(cfg: BatchConfig) -> List[RowResult]:
@@ -433,6 +442,9 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
                     show_annotations=cfg.show_annotations,
                     version=cfg.version,
                     has_status_column=has_status_column,
+                    crop_cameras=cfg.crop_cameras,
+                    crop_padding=cfg.crop_padding,
+                    crop_min_size=cfg.crop_min_size,
                 )
                 return RowResult(frame=frame, success=True, output_dir=out)
             except Exception as e:
@@ -598,6 +610,31 @@ def parse_args():
         default=False,
         help="Abort the batch on the first error instead of continuing.",
     )
+    parser.add_argument(
+        "--crop-view",
+        action="store_true",
+        default=False,
+        dest="crop_cameras",
+        help=(
+            "Replace the full camera grid with a single cropped view of the "
+            "camera showing the largest projected BBOX ROI. "
+            "Output file: {prefix}_visualization_crop.png."
+        ),
+    )
+    parser.add_argument(
+        "--crop-padding",
+        type=int,
+        default=40,
+        metavar="PX",
+        help="Pixel padding around the ROI crop (default: 40).",
+    )
+    parser.add_argument(
+        "--crop-min-size",
+        type=int,
+        default=300,
+        metavar="PX",
+        help="Minimum crop dimension in pixels (default: 300).",
+    )
 
     return parser.parse_args()
 
@@ -616,6 +653,9 @@ def main():
         version=args.version,
         workers=args.workers,
         fail_fast=args.fail_fast,
+        crop_cameras=args.crop_cameras,
+        crop_padding=args.crop_padding,
+        crop_min_size=args.crop_min_size,
     )
 
     results = run_batch(cfg)
