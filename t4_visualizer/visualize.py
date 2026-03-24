@@ -120,9 +120,12 @@ def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
                           img_w: int, img_h: int) -> Optional[tuple]:
     """Project the 8 corners of a detection BBOX onto a camera image.
 
-    Returns (u_min, v_min, u_max, v_max) clipped to the image bounds,
-    or None if no corner projects in front of the camera or the
+    Returns (u_min, v_min, u_max, v_max, visibility) clipped to the image
+    bounds, or None if no corner projects in front of the camera or the
     resulting ROI is empty / fully outside the image.
+
+    ``visibility`` is the ratio of clipped area to raw projected area
+    (0.0–1.0); 1.0 means the entire BBOX projection is within the image.
 
     Only corners with z > 0 in camera frame are used, so the result is a
     safe under-estimate when the box straddles the image plane.
@@ -165,7 +168,14 @@ def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
     if u_max - u_min < 2 or v_max - v_min < 2:
         return None
 
-    return (u_min, v_min, u_max, v_max)
+    raw_area = (u_max_raw - u_min_raw) * (v_max_raw - v_min_raw)
+    if raw_area > 0:
+        clipped_area = (u_max - u_min) * (v_max - v_min)
+        visibility = clipped_area / raw_area
+    else:
+        visibility = 1.0
+
+    return (u_min, v_min, u_max, v_max, visibility)
 
 
 def _get_target_ann_tokens(t4, sample, target_objects: List[TargetObject]) -> Set[str]:
@@ -392,7 +402,7 @@ def _fill_camera_axes(t4, sample, camera_channels, show_annotations, axes,
                 # Try full 3D BBOX → 2D ROI first
                 det_roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
                 if det_roi is not None:
-                    u_min, v_min, u_max, v_max = det_roi
+                    u_min, v_min, u_max, v_max = det_roi[:4]
                     bw, bh = u_max - u_min, v_max - v_min
                     rect = patches.Rectangle(
                         (u_min, v_min), bw, bh,
@@ -531,12 +541,16 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
 
 def _find_largest_roi_camera(t4, sample, camera_channels, target_objects):
     """Return (channel, token, roi, img_w, img_h) for the camera+object pair
-    whose projected BBOX ROI has the largest pixel area.  Returns None if no
-    ROI is visible in any camera.
+    whose projected BBOX ROI has the best score.  Returns None if no ROI is
+    visible in any camera.
+
+    Scoring: ROIs with visibility >= 0.5 (at least half of the projected BBOX
+    is within the image) are preferred over those that are mostly out of frame.
+    Within the same visibility tier, the largest clipped area wins.
     """
     from PIL import Image as PILImage
 
-    best = None  # (channel, token, roi, area, img_w, img_h)
+    best = None  # (channel, token, roi, score_tier, area, img_w, img_h)
     for channel in camera_channels:
         token = sample.data.get(channel)
         if token is None:
@@ -551,13 +565,14 @@ def _find_largest_roi_camera(t4, sample, camera_channels, target_objects):
             roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
             if roi is None:
                 continue
-            u_min, v_min, u_max, v_max = roi
+            u_min, v_min, u_max, v_max, visibility = roi
             area = (u_max - u_min) * (v_max - v_min)
-            if best is None or area > best[3]:
-                best = (channel, token, roi, area, img_w, img_h)
+            tier = 1 if visibility >= 0.5 else 0
+            if best is None or (tier, area) > (best[3], best[4]):
+                best = (channel, token, roi, tier, area, img_w, img_h)
     if best is None:
         return None
-    channel, token, roi, _, img_w, img_h = best
+    channel, token, roi, _, _, img_w, img_h = best
     return channel, token, roi, img_w, img_h
 
 
@@ -566,7 +581,7 @@ def _compute_crop_limits(roi, img_w, img_h, padding: int, min_size: int):
 
     Returns (x0, x1, y0, y1) in image-pixel coordinates (y increases down).
     """
-    u_min, v_min, u_max, v_max = roi
+    u_min, v_min, u_max, v_max = roi[:4]
 
     u0 = max(0.0, u_min - padding)
     u1 = min(float(img_w), u_max + padding)
