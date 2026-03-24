@@ -78,10 +78,13 @@ def download_dataset(t4dataset_id: str, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     expected_path = dest_dir / t4dataset_id
 
-    # Skip download if already present
-    if expected_path.exists() and _looks_like_t4dataset(expected_path):
-        print(f"  [downloader] Dataset already exists, skipping download: {expected_path}")
-        return expected_path
+    # Skip download if already present (flatten nested webauto layout first if needed)
+    if expected_path.exists():
+        if not _looks_like_t4dataset(expected_path):
+            _try_flatten(expected_path, t4dataset_id)
+        if _looks_like_t4dataset(expected_path):
+            print(f"  [downloader] Dataset already exists, skipping download: {expected_path}")
+            return expected_path
 
     print(f"  [downloader] Downloading {t4dataset_id} → {expected_path}")
 
@@ -402,6 +405,59 @@ def cache_main() -> None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _find_webauto_nested(root: Path, t4dataset_id: str) -> Optional[Path]:
+    """Return the versioned directory webauto places data in, if it exists.
+
+    webauto puts data at::
+
+        root/annotation_dataset/<t4dataset_id>/<version>/
+
+    Returns the latest version directory, or None if not found.
+    """
+    ann_uuid_dir = root / "annotation_dataset" / t4dataset_id
+    if not ann_uuid_dir.is_dir():
+        return None
+    versions = sorted(p for p in ann_uuid_dir.iterdir() if p.is_dir())
+    return versions[-1] if versions else None
+
+
+def _try_flatten(root: Path, t4dataset_id: str, dst: Optional[Path] = None) -> bool:
+    """Move contents of webauto's versioned dir into *dst* (default: *root*).
+
+    Handles two layouts produced by webauto depending on how ``--asset-dir``
+    was specified:
+
+    * ``root/annotation_dataset/<uuid>/<version>/``  (new downloads, root = dest_dir)
+    * ``root/annotation_dataset/<uuid>/<version>/``  (old downloads, root = dest_dir/uuid)
+
+    Items are moved into *dst* only if they don't already exist there, so
+    a partially-flattened directory is safe to re-process.  Empty wrapper
+    directories are removed afterwards (best-effort).
+
+    Returns True if any items were moved.
+    """
+    src = _find_webauto_nested(root, t4dataset_id)
+    if src is None:
+        return False
+    if dst is None:
+        dst = root
+    dst.mkdir(parents=True, exist_ok=True)
+    moved = False
+    for item in list(src.iterdir()):
+        target = dst / item.name
+        if not target.exists():
+            print(f"  [downloader] Moving {item.name}  →  {dst}")
+            shutil.move(str(item), str(target))
+            moved = True
+    # Remove now-empty wrapper dirs (annotation_dataset/<uuid>/<version>/ etc.)
+    for d in [src, src.parent, src.parent.parent]:
+        try:
+            d.rmdir()
+        except OSError:
+            break
+    return moved
+
+
 def _looks_like_t4dataset(path: Path) -> bool:
     """Heuristic check: does this directory contain T4 annotation files?"""
     # T4 datasets have an annotation directory (or versioned annotation dir)
@@ -465,22 +521,6 @@ def _download_impl(t4dataset_id: str, dest_dir: Path, dataset_path: Path) -> Non
         )
 
     # webauto writes to dest_dir/annotation_dataset/<uuid>/<version>/
-    # Move the versioned directory to dataset_path so callers find it there.
-    ann_uuid_dir = dest_dir / "annotation_dataset" / t4dataset_id
-    if ann_uuid_dir.exists():
-        versions = sorted(p for p in ann_uuid_dir.iterdir() if p.is_dir())
-        if versions:
-            downloaded = versions[-1]  # use latest version directory
-            print(f"  [downloader] Moving {downloaded} → {dataset_path}")
-            shutil.move(str(downloaded), str(dataset_path))
-            # Remove now-empty annotation_dataset/<uuid> and annotation_dataset/
-            # dirs (best-effort; ignore if non-empty).
-            try:
-                ann_uuid_dir.rmdir()
-            except OSError:
-                pass
-            try:
-                (dest_dir / "annotation_dataset").rmdir()
-            except OSError:
-                pass
+    # Flatten the versioned directory contents into dataset_path.
+    _try_flatten(dest_dir, t4dataset_id, dst=dataset_path)
 
