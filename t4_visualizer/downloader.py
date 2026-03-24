@@ -34,7 +34,7 @@ import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +164,41 @@ class DatasetCache:
         with self._lock():
             self._touch(t4dataset_id)
 
+    def ensure_many(self, dataset_ids: List[str]) -> Dict[str, Path]:
+        """Download all *dataset_ids* with minimum evictions.
+
+        Unlike calling ``ensure()`` N times, this method first pre-evicts
+        LRU entries that are **not** in *dataset_ids* to free space, so
+        no needed dataset is ever evicted mid-run.
+
+        Steps:
+        1. Deduplicate *dataset_ids* (preserves order).
+        2. Under the lock: evict non-needed LRU entries to fit the whole
+           set within *max_cached* (best-effort; warns if impossible).
+        3. Download each missing dataset outside the lock.
+        4. Touch every ID to mark it as recently used.
+
+        Returns a ``{t4dataset_id: Path}`` mapping for every ID.
+        """
+        dataset_ids = list(dict.fromkeys(dataset_ids))  # dedup, keep order
+        needed = set(dataset_ids)
+
+        with self._lock():
+            if self.max_cached > 0:
+                already = sum(1 for did in needed if self._on_disk(did))
+                new_count = len(needed) - already
+                # Keep at most (max_cached - new_count) non-needed entries
+                # so there is room for all new downloads.
+                target = max(0, self.max_cached - new_count)
+                self._evict_not_needed(needed, keep=target)
+
+        paths: Dict[str, Path] = {}
+        for did in dataset_ids:
+            paths[did] = download_dataset(did, self.data_dir)
+            with self._lock():
+                self._touch(did)
+        return paths
+
     def evict_lru(self, keep: int) -> List[str]:
         """Evict datasets until at most *keep* remain.  Returns evicted IDs."""
         with self._lock():
@@ -224,6 +259,33 @@ class DatasetCache:
             self._delete(lru_id)
             evicted.append(lru_id)
             print(f"  [cache] Evicted {lru_id}  (last accessed: {ts})")
+        self._write_index(index)
+        return evicted
+
+    def _evict_not_needed(self, needed: set, keep: int) -> List[str]:
+        """Evict LRU entries that are *not* in *needed* until on-disk <= keep.
+
+        If there are not enough evictable (non-needed) entries to reach
+        *keep*, a warning is printed and the needed datasets are left alone.
+        """
+        index = self._read_index()
+        on_disk = {k: v for k, v in index.items()
+                   if (self.data_dir / k).exists()}
+        evictable = {k: v for k, v in on_disk.items() if k not in needed}
+        evicted = []
+        while len(on_disk) > keep:
+            if not evictable:
+                over = len(on_disk) - keep
+                print(f"  [cache] WARNING: {over} needed dataset(s) exceed "
+                      f"cache_limit ({self.max_cached}); keeping them anyway.")
+                break
+            lru_id = min(evictable, key=lambda k: evictable[k])
+            ts = evictable.pop(lru_id)
+            on_disk.pop(lru_id)
+            index.pop(lru_id, None)
+            self._delete(lru_id)
+            evicted.append(lru_id)
+            print(f"  [cache] Evicted (pre-run) {lru_id}  (last accessed: {ts})")
         self._write_index(index)
         return evicted
 

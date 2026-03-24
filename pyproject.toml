@@ -18,6 +18,7 @@ t4-batch = "t4_visualizer.batch:main"
 t4-visualize = "t4_visualizer.visualize:main"
 t4-inspect = "t4_visualizer.inspect:main"
 t4-cache = "t4_visualizer.downloader:cache_main"
+t4-multi = "t4_visualizer.batch:multi_main"
 
 [tool.setuptools.packages.find]
 where = ["."]
