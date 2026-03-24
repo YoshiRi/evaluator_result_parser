@@ -31,15 +31,162 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import numpy as np
+
+
+@dataclass
+class TargetObject:
+    """One target object to highlight in the visualization (from CSV row)."""
+    uuid: str           # instance_token in T4 dataset
+    x: float = 0.0     # detection position in ego frame (from CSV)
+    y: float = 0.0
+    z: float = 0.0
+    label: str = ""
+    width: float = 0.0   # BBOX dimensions in ego frame [m]
+    length: float = 0.0
+    height: float = 0.0
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _box_token(box) -> str:
+    """Extract the annotation token from a Box2D or Box3D object."""
+    for attr in ("token", "annotation_token"):
+        val = getattr(box, attr, None)
+        if val:
+            return str(val)
+    return ""
+
+
+def _project_ego_to_cam(t4, sample_data_token: str, point_ego) -> Optional[tuple]:
+    """Project a 3D point in ego (base_link) frame to camera pixel (u, v).
+
+    Uses calibrated_sensor from the T4 dataset (no rosbag / TF needed).
+
+    Args:
+        t4: Tier4 instance.
+        sample_data_token: Token of the camera SampleData.
+        point_ego: (x, y, z) in ego / base_link frame.
+
+    Returns:
+        (u, v) float pixel coordinates, or None if behind the camera or
+        if the calibrated sensor has no intrinsics (i.e. LiDAR).
+    """
+    try:
+        sd = t4.get("sample_data", sample_data_token)
+        cs = t4.get("calibrated_sensor", sd.calibrated_sensor_token)
+
+        # camera_intrinsic is empty for LiDAR
+        K_raw = cs.camera_intrinsic
+        if K_raw is None or len(K_raw) == 0:
+            return None
+        K = np.array(K_raw, dtype=float)
+        if K.shape != (3, 3):
+            return None
+
+        t_ego = np.array(cs.translation, dtype=float)
+        p = np.array(point_ego, dtype=float)
+
+        # Rotation: sensor → ego (stored as [w, x, y, z] in T4)
+        rot = cs.rotation
+        if hasattr(rot, "inverse"):
+            # Already a pyquaternion Quaternion
+            q = rot
+        else:
+            # List/array [w, x, y, z]
+            from pyquaternion import Quaternion
+            q = Quaternion(np.array(rot, dtype=float))
+
+        # ego → sensor:  p_cam = q^{-1} * (p_ego - t)
+        p_cam = q.inverse.rotate(p - t_ego)
+
+        if p_cam[2] <= 0.1:          # behind (or too close to) camera
+            return None
+
+        uvw = K @ p_cam
+        return (float(uvw[0] / uvw[2]), float(uvw[1] / uvw[2]))
+
+    except Exception:
+        return None
+
+
+def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
+                          img_w: int, img_h: int) -> Optional[tuple]:
+    """Project the 8 corners of a detection BBOX onto a camera image.
+
+    Returns (u_min, v_min, u_max, v_max) clipped to the image bounds,
+    or None if no corner projects in front of the camera or the
+    resulting ROI is empty / fully outside the image.
+
+    Only corners with z > 0 in camera frame are used, so the result is a
+    safe under-estimate when the box straddles the image plane.
+    """
+    if obj.width <= 0 or obj.length <= 0 or obj.height <= 0:
+        return None
+
+    hw, hl, hh = obj.width / 2.0, obj.length / 2.0, obj.height / 2.0
+    cx, cy, cz = obj.x, obj.y, obj.z
+
+    # 8 corners of the axis-aligned bounding box in ego frame
+    corners = [
+        (cx + dx * hw, cy + dy * hl, cz + dz * hh)
+        for dx in (-1.0, 1.0)
+        for dy in (-1.0, 1.0)
+        for dz in (-1.0, 1.0)
+    ]
+
+    us, vs = [], []
+    for corner in corners:
+        uv = _project_ego_to_cam(t4, sample_data_token, corner)
+        if uv is not None:        # None means behind the camera
+            us.append(uv[0])
+            vs.append(uv[1])
+
+    if not us:
+        return None
+
+    # Raw bounding rect of projected corners
+    u_min_raw, u_max_raw = min(us), max(us)
+    v_min_raw, v_max_raw = min(vs), max(vs)
+
+    # Clip to image bounds
+    u_min = max(0.0, min(u_min_raw, float(img_w - 1)))
+    u_max = max(0.0, min(u_max_raw, float(img_w - 1)))
+    v_min = max(0.0, min(v_min_raw, float(img_h - 1)))
+    v_max = max(0.0, min(v_max_raw, float(img_h - 1)))
+
+    # Reject degenerate / fully-outside rectangles
+    if u_max - u_min < 2 or v_max - v_min < 2:
+        return None
+
+    return (u_min, v_min, u_max, v_max)
+
+
+def _get_target_ann_tokens(t4, sample, target_objects: List[TargetObject]) -> Set[str]:
+    """Return sample_annotation tokens for target instance_tokens in this sample."""
+    if not target_objects:
+        return set()
+    instance_tokens = {obj.uuid for obj in target_objects}
+    result = set()
+    try:
+        for ann in t4.sample_annotation:
+            if ann.sample_token == sample.token and ann.instance_token in instance_tokens:
+                result.add(ann.token)
+    except Exception as e:
+        print(f"  WARNING: Could not resolve annotation tokens: {e}")
+    if not result:
+        print(
+            f"  WARNING: No annotation found for instance_tokens {instance_tokens}. "
+            "Detection position markers will be drawn in BEV as fallback."
+        )
+    return result
+
 
 def find_closest_sample(t4, timestamp_us: int):
     """Return the Sample record whose timestamp is closest to *timestamp_us*.
@@ -56,6 +203,50 @@ def find_closest_sample(t4, timestamp_us: int):
         return None
     best = min(samples, key=lambda s: abs(s.timestamp - timestamp_us))
     return best
+
+
+def find_sample_by_scene_and_index(t4, scene_name: str, frame_index: int):
+    """Return the frame_index-th sample in the named scene.
+
+    Walks the linked list of samples starting from scene.first_sample_token.
+
+    Args:
+        t4: Tier4 instance already loaded with the dataset.
+        scene_name: Value of the ``name`` field in the scene table.
+        frame_index: 0-based index of the frame within the scene.
+
+    Returns:
+        The Sample object at position *frame_index*.
+
+    Raises:
+        ValueError: If no scene with *scene_name* is found.
+        IndexError: If *frame_index* exceeds the number of samples in the scene.
+    """
+    scene = next((s for s in t4.scene if s.name == scene_name), None)
+    if scene is None:
+        available = t4.scene
+        if len(available) == 1:
+            print(
+                f"  WARNING: Scene '{scene_name}' not found; "
+                f"falling back to the only scene in dataset: '{available[0].name}'"
+            )
+            scene = available[0]
+        else:
+            raise ValueError(
+                f"Scene '{scene_name}' not found in dataset.\n"
+                f"Available scenes: {[s.name for s in available]}"
+            )
+
+    token = scene.first_sample_token
+    for i in range(frame_index):
+        sample = t4.get("sample", token)
+        if not sample.next:
+            raise IndexError(
+                f"frame_index {frame_index} is out of range for scene '{scene_name}' "
+                f"(scene contains only {i + 1} sample(s))."
+            )
+        token = sample.next
+    return t4.get("sample", token)
 
 
 def list_camera_channels(t4, sample) -> List[str]:
@@ -89,6 +280,7 @@ def visualize_static(
     show_annotations: bool = True,
     save_dir: Optional[str] = None,
     filename_prefix: Optional[str] = None,
+    target_objects: Optional[List[TargetObject]] = None,
 ) -> None:
     """Render images and a bird's-eye-view point cloud with matplotlib.
 
@@ -117,31 +309,30 @@ def visualize_static(
     selected_cameras = cameras if cameras else available_cameras
     selected_cameras = [c for c in selected_cameras if c in available_cameras]
 
+    target_ann_tokens = _get_target_ann_tokens(t4, sample, target_objects or [])
+
     if not selected_cameras:
         print("  WARNING: No matching camera channels found in this sample.")
-    else:
-        _plot_images(t4, sample, selected_cameras, show_annotations, save_dir, prefix)
 
     lidar_channels = list_lidar_channels(t4, sample)
-    if lidar_channels:
-        _plot_bev_pointcloud(t4, sample, lidar_channels[0], show_annotations, save_dir, prefix)
-    else:
+    if not lidar_channels:
         print("  WARNING: No LiDAR data found in this sample.")
+    lidar_channel = lidar_channels[0] if lidar_channels else None
+
+    _plot_combined(
+        t4, sample, selected_cameras, lidar_channel, show_annotations,
+        save_dir, prefix, target_ann_tokens, target_objects or [],
+    )
 
     if not save_dir:
         plt.show()
 
 
-def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filename_prefix=None):
-    """Create a figure with one subplot per camera."""
-    import matplotlib.pyplot as plt
+def _fill_camera_axes(t4, sample, camera_channels, show_annotations, axes,
+                      target_ann_tokens, target_objects):
+    """Render camera images and detection overlays onto the given axes list."""
+    import matplotlib.patches as patches
     from PIL import Image
-
-    n = len(camera_channels)
-    ncols = min(3, n)
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 6, nrows * 4))
-    axes = np.array(axes).flatten() if n > 1 else [axes]
 
     for idx, channel in enumerate(camera_channels):
         ax = axes[idx]
@@ -150,9 +341,8 @@ def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filena
             ax.set_visible(False)
             continue
 
-        # Get data path + 2D boxes
         if show_annotations:
-            data_path, boxes_2d, cam_intrinsic = t4.get_sample_data(
+            data_path, boxes_2d, _ = t4.get_sample_data(
                 token, as_3d=False, as_sensor_coord=True
             )
         else:
@@ -165,41 +355,77 @@ def _plot_images(t4, sample, camera_channels, show_annotations, save_dir, filena
         ax.axis("off")
 
         for box in boxes_2d:
-            # box is a Box2D with .roi attribute (l, t, r, b) or similar
             try:
                 roi = box.roi  # (left, top, right, bottom)
-                x, y, w, h = roi[0], roi[1], roi[2] - roi[0], roi[3] - roi[1]
+                bx, by, w, h = roi[0], roi[1], roi[2] - roi[0], roi[3] - roi[1]
+                is_target = bool(target_ann_tokens) and _box_token(box) in target_ann_tokens
+                color = "red" if is_target else "lime"
+                lw = 2.5 if is_target else 1.0
                 rect = patches.Rectangle(
-                    (x, y), w, h,
-                    linewidth=1.5, edgecolor="lime", facecolor="none"
+                    (bx, by), w, h,
+                    linewidth=lw, edgecolor=color, facecolor="none",
+                    zorder=3 if is_target else 2,
                 )
                 ax.add_patch(rect)
+                if is_target:
+                    label_text = getattr(box, "label", None) or ""
+                    ax.text(
+                        bx, by - 3, f"[TARGET] {label_text}",
+                        color="red", fontsize=7, fontweight="bold",
+                        va="bottom", zorder=4,
+                    )
             except Exception:
                 pass
 
-    # Hide unused subplots
+        if target_objects:
+            img_w, img_h = img.size
+            for obj in target_objects:
+                # Try full 3D BBOX → 2D ROI first
+                det_roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
+                if det_roi is not None:
+                    u_min, v_min, u_max, v_max = det_roi
+                    bw, bh = u_max - u_min, v_max - v_min
+                    rect = patches.Rectangle(
+                        (u_min, v_min), bw, bh,
+                        linewidth=2.0, edgecolor="yellow", facecolor="none",
+                        linestyle="--", zorder=7,
+                    )
+                    ax.add_patch(rect)
+                    ax.text(
+                        u_min, v_min - 3, f"det:{obj.label or '?'}",
+                        color="yellow", fontsize=7, fontweight="bold",
+                        va="bottom", zorder=7,
+                    )
+                    continue
+
+                # Fallback: center point marker
+                uv = _project_ego_to_cam(t4, token, [obj.x, obj.y, obj.z])
+                if uv is None:
+                    continue
+                u, v = uv
+                if not (0 <= u < img_w and 0 <= v < img_h):
+                    continue
+                ax.plot(u, v, "+", color="yellow", markersize=18,
+                        markeredgewidth=2.5, zorder=7)
+                circle = patches.Circle(
+                    (u, v), radius=12,
+                    fill=False, edgecolor="yellow", linewidth=2.0, zorder=7,
+                )
+                ax.add_patch(circle)
+                ax.text(
+                    u + 14, v, f"det:{obj.label or '?'}",
+                    color="yellow", fontsize=7, fontweight="bold",
+                    va="center", zorder=7,
+                )
+
+    # Hide unused axes
     for i in range(len(camera_channels), len(axes)):
         axes[i].set_visible(False)
 
-    ts_us = sample.timestamp
-    fig.suptitle(
-        f"Cameras — timestamp: {ts_us} µs  ({ts_us / 1e6:.3f} s)\ntoken: {sample.token}",
-        fontsize=10,
-    )
-    fig.tight_layout()
 
-    if save_dir:
-        Path(save_dir).mkdir(parents=True, exist_ok=True)
-        prefix = filename_prefix if filename_prefix else str(ts_us)
-        out = Path(save_dir) / f"{prefix}_cameras.png"
-        fig.savefig(out, dpi=150)
-        print(f"  Saved: {out}")
-    plt.close(fig)
-
-
-def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, filename_prefix=None):
-    """Bird's-eye-view scatter plot of the LiDAR point cloud."""
-    import matplotlib.pyplot as plt
+def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
+                 target_ann_tokens, target_objects):
+    """Render BEV point cloud and detection overlays onto the given axes."""
     import matplotlib.patches as patches
 
     token = sample.data.get(lidar_channel)
@@ -220,51 +446,146 @@ def _plot_bev_pointcloud(t4, sample, lidar_channel, show_annotations, save_dir, 
         print(f"  WARNING: Could not load point cloud from {data_path}")
         return
 
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    intensity = points[:, 3] if points.shape[1] > 3 else np.ones(len(x))
+    x_all = points[:, 0]
+    y_all = points[:, 1]
+    intensity_all = points[:, 3] if points.shape[1] > 3 else np.ones(len(x_all))
 
-    # Down-sample for speed
+    MARGIN = 3.0   # extra space around BBOX extent [m]
+
+    # Compute view extent from all target BBOXes (or fall back to center point)
+    view_xlim = None
+    view_ylim = None
+    if target_objects:
+        xs_min, xs_max, ys_min, ys_max = [], [], [], []
+        for obj in target_objects:
+            hw = obj.width  / 2.0 if obj.width  > 0 else 0.0
+            hl = obj.length / 2.0 if obj.length > 0 else 0.0
+            xs_min.append(obj.x - hw)
+            xs_max.append(obj.x + hw)
+            ys_min.append(obj.y - hl)
+            ys_max.append(obj.y + hl)
+        x_lo = min(xs_min) - MARGIN
+        x_hi = max(xs_max) + MARGIN
+        y_lo = min(ys_min) - MARGIN
+        y_hi = max(ys_max) + MARGIN
+        view_xlim = (x_lo, x_hi)
+        view_ylim = (y_lo, y_hi)
+        # Crop point cloud to the view region (no need to load points outside)
+        mask = (x_all >= x_lo) & (x_all <= x_hi) & (y_all >= y_lo) & (y_all <= y_hi)
+        x, y = x_all[mask], y_all[mask]
+        intensity = intensity_all[mask]
+    else:
+        x, y, intensity = x_all, y_all, intensity_all
+
     max_pts = 80_000
     if len(x) > max_pts:
         idx = np.random.choice(len(x), max_pts, replace=False)
-        x, y, z, intensity = x[idx], y[idx], z[idx], intensity[idx]
+        x, y, intensity = x[idx], y[idx], intensity[idx]
 
-    fig, ax = plt.subplots(figsize=(10, 10))
     sc = ax.scatter(x, y, c=intensity, s=0.5, cmap="viridis", vmin=0, vmax=255)
-    plt.colorbar(sc, ax=ax, label="Intensity")
+    ax.figure.colorbar(sc, ax=ax, label="Intensity", shrink=0.7)
 
-    # Draw 3D box footprints (BEV)
     for box in boxes_3d:
         try:
-            _draw_box_bev(ax, box)
+            is_target = bool(target_ann_tokens) and _box_token(box) in target_ann_tokens
+            _draw_box_bev(ax, box, highlight=is_target)
         except Exception:
             pass
+
+    if target_objects:
+        for obj in target_objects:
+            if obj.width > 0 and obj.length > 0:
+                half_w, half_l = obj.width / 2.0, obj.length / 2.0
+                rect = patches.Rectangle(
+                    (obj.x - half_w, obj.y - half_l),
+                    obj.width, obj.length,
+                    linewidth=2.0, edgecolor="yellow", facecolor="none",
+                    linestyle="--", zorder=6,
+                )
+                ax.add_patch(rect)
+            ax.annotate(
+                f"{obj.label or 'target'}\n({obj.x:.1f},{obj.y:.1f})",
+                (obj.x, obj.y),
+                xytext=(6, 6), textcoords="offset points",
+                color="yellow", fontsize=7, fontweight="bold", zorder=7,
+            )
 
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
     ax.set_aspect("equal")
     ax.set_title(f"LiDAR BEV — {lidar_channel}")
 
+    if view_xlim is not None:
+        ax.set_xlim(view_xlim)
+        ax.set_ylim(view_ylim)
+
+
+def _plot_combined(t4, sample, camera_channels, lidar_channel, show_annotations,
+                   save_dir, filename_prefix, target_ann_tokens, target_objects):
+    """Single figure combining camera grid (left) and BEV point cloud (right)."""
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
+    n_cams = len(camera_channels)
+    cam_ncols = min(3, n_cams) if n_cams > 0 else 1
+    cam_nrows = max(1, (n_cams + cam_ncols - 1) // cam_ncols)
+    has_lidar = lidar_channel is not None
+
+    # Figure width: camera columns + 1 BEV column (slightly wider)
+    bev_col_w = 1.3
+    fig_w = cam_ncols * 6 + (7 * bev_col_w if has_lidar else 0)
+    fig_h = cam_nrows * 4 + 0.5   # +0.5 for suptitle
+
+    if has_lidar:
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        gs = gridspec.GridSpec(
+            cam_nrows, cam_ncols + 1, figure=fig,
+            width_ratios=[1.0] * cam_ncols + [bev_col_w],
+            hspace=0.05, wspace=0.05,
+        )
+        cam_axes = [fig.add_subplot(gs[r, c])
+                    for r in range(cam_nrows) for c in range(cam_ncols)]
+        bev_ax = fig.add_subplot(gs[:, cam_ncols])  # span all rows
+    else:
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        gs = gridspec.GridSpec(cam_nrows, cam_ncols, figure=fig,
+                               hspace=0.05, wspace=0.05)
+        cam_axes = [fig.add_subplot(gs[r, c])
+                    for r in range(cam_nrows) for c in range(cam_ncols)]
+        bev_ax = None
+
+    if n_cams > 0:
+        _fill_camera_axes(t4, sample, camera_channels, show_annotations,
+                          cam_axes, target_ann_tokens, target_objects)
+
+    if has_lidar and bev_ax is not None:
+        _fill_bev_ax(t4, sample, lidar_channel, show_annotations,
+                     bev_ax, target_ann_tokens, target_objects)
+
     ts_us = sample.timestamp
     fig.suptitle(
-        f"Point Cloud — timestamp: {ts_us} µs  ({ts_us / 1e6:.3f} s)\ntoken: {sample.token}",
-        fontsize=10,
+        f"timestamp: {ts_us} µs  ({ts_us / 1e6:.3f} s)    token: {sample.token}",
+        fontsize=9,
     )
     fig.tight_layout()
 
     if save_dir:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         prefix = filename_prefix if filename_prefix else str(ts_us)
-        out = Path(save_dir) / f"{prefix}_pointcloud.png"
-        fig.savefig(out, dpi=150)
+        out = Path(save_dir) / f"{prefix}_visualization.png"
+        fig.savefig(out, dpi=150, bbox_inches="tight")
         print(f"  Saved: {out}")
     plt.close(fig)
 
 
-def _draw_box_bev(ax, box):
+def _draw_box_bev(ax, box, highlight: bool = False):
     """Draw the BEV footprint of a Box3D on a matplotlib Axes."""
     import matplotlib.patches as patches
-    from matplotlib.patches import FancyArrow
+
+    color = "yellow" if highlight else "cyan"
+    lw = 2.5 if highlight else 1.0
+    arrow_color = "red" if highlight else "orange"
+    zorder = 4 if highlight else 2
 
     # box.center: [x, y, z], box.size: [w, l, h], box.rotation: Quaternion
     center = box.center
@@ -278,21 +599,28 @@ def _draw_box_bev(ax, box):
         bev = corners[:2, 4:]  # (2, 4) — x and y of 4 bottom corners
         xs = np.append(bev[0], bev[0, 0])
         ys = np.append(bev[1], bev[1, 0])
-        ax.plot(xs, ys, color="red", linewidth=1.2)
+        ax.plot(xs, ys, color=color, linewidth=lw, zorder=zorder)
         # Draw heading arrow from center to front midpoint
         front_mid = (bev[:, 0] + bev[:, 1]) / 2
         ax.annotate(
             "",
             xy=(front_mid[0], front_mid[1]),
             xytext=(center[0], center[1]),
-            arrowprops=dict(arrowstyle="->", color="orange", lw=1.2),
+            arrowprops=dict(arrowstyle="->", color=arrow_color, lw=lw),
+            zorder=zorder,
         )
+        if highlight:
+            ax.text(
+                center[0], center[1], "[T]",
+                color="yellow", fontsize=7, fontweight="bold",
+                ha="center", va="center", zorder=5,
+            )
     except AttributeError:
         # Fallback: draw a simple rectangle from center + size
         w, l = float(size[0]), float(size[1])
         rect = patches.Rectangle(
             (center[0] - w / 2, center[1] - l / 2), w, l,
-            linewidth=1.2, edgecolor="red", facecolor="none"
+            linewidth=lw, edgecolor=color, facecolor="none", zorder=zorder,
         )
         ax.add_patch(rect)
 
@@ -306,9 +634,18 @@ def _load_pointcloud(data_path: str) -> Optional[np.ndarray]:
 
     suffix = path.suffix.lower()
     if suffix == ".bin" or data_path.endswith(".pcd.bin"):
-        # Binary float32 format (KITTI-style): x, y, z, intensity
-        pts = np.fromfile(data_path, dtype=np.float32).reshape(-1, 4)
-        return pts
+        # Binary float32 format: x, y, z, intensity[, ring, time, ...]
+        raw = np.fromfile(data_path, dtype=np.float32)
+        for ncols in (4, 5, 6, 3):
+            if raw.size % ncols == 0:
+                pts = raw.reshape(-1, ncols)
+                # Always return Nx4 (pad intensity with zeros if only 3 cols)
+                if ncols >= 4:
+                    return pts[:, :4]
+                else:
+                    return np.column_stack([pts, np.zeros(len(pts), dtype=np.float32)])
+        print(f"  WARNING: Cannot determine point cloud stride for size {raw.size}: {data_path}")
+        return None
     elif suffix == ".pcd":
         return _load_pcd(data_path)
     else:
