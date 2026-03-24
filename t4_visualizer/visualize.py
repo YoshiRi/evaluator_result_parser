@@ -809,21 +809,29 @@ def _draw_box_bev(ax, box, highlight: bool = False):
     arrow_color = "red" if highlight else "orange"
     zorder = 4 if highlight else 2
 
-    # box.center: [x, y, z], box.size: [w, l, h], box.rotation: Quaternion
     center = box.center
-    size = box.size  # (w, l, h) or (l, w, h) depending on convention
+    size = box.size
 
-    # Get 4 corners in BEV using the box's rotation
     try:
-        # t4-devkit Box3D corners: shape (3, 8) — top 4 + bottom 4
-        corners = box.corners  # (3, 8)
-        # Use only the bottom 4 corners (indices 4-7) for BEV footprint
-        bev = corners[:2, 4:]  # (2, 4) — x and y of 4 bottom corners
-        xs = np.append(bev[0], bev[0, 0])
-        ys = np.append(bev[1], bev[1, 0])
+        # t4-devkit Box3D.corners() is a METHOD returning shape (8, 3).
+        # Corner layout (x=forward, y=left, z=up), pre-rotation:
+        #   i=0: ( l/2,  w/2,  h/2)  front-left-top
+        #   i=1: ( l/2, -w/2,  h/2)  front-right-top
+        #   i=2: ( l/2, -w/2, -h/2)  front-right-bottom
+        #   i=3: ( l/2,  w/2, -h/2)  front-left-bottom
+        #   i=4: (-l/2,  w/2,  h/2)  rear-left-top
+        #   i=5: (-l/2, -w/2,  h/2)  rear-right-top
+        #   i=6: (-l/2, -w/2, -h/2)  rear-right-bottom
+        #   i=7: (-l/2,  w/2, -h/2)  rear-left-bottom
+        corners = box.corners()  # (8, 3)
+        # BEV polygon: top-face corners in traversal order 0→1→5→4→0
+        #   forms a proper closed rectangle in the xy-plane.
+        poly_xy = corners[[0, 1, 5, 4], :2]  # (4, 2)
+        xs = np.append(poly_xy[:, 0], poly_xy[0, 0])
+        ys = np.append(poly_xy[:, 1], poly_xy[0, 1])
         ax.plot(xs, ys, color=color, linewidth=lw, zorder=zorder)
-        # Draw heading arrow from center to front midpoint
-        front_mid = (bev[:, 0] + bev[:, 1]) / 2
+        # Heading arrow: box centre → midpoint of front edge (avg of 0 and 1)
+        front_mid = (corners[0, :2] + corners[1, :2]) / 2
         ax.annotate(
             "",
             xy=(front_mid[0], front_mid[1]),
@@ -837,8 +845,8 @@ def _draw_box_bev(ax, box, highlight: bool = False):
                 color="yellow", fontsize=7, fontweight="bold",
                 ha="center", va="center", zorder=5,
             )
-    except AttributeError:
-        # Fallback: draw a simple rectangle from center + size
+    except (AttributeError, TypeError):
+        # Fallback: axis-aligned rectangle (rotation ignored)
         w, l = float(size[0]), float(size[1])
         rect = patches.Rectangle(
             (center[0] - w / 2, center[1] - l / 2), w, l,
