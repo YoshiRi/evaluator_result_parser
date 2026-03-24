@@ -51,6 +51,7 @@ class TargetObject:
     width: float = 0.0   # BBOX dimensions in ego frame [m]
     length: float = 0.0
     height: float = 0.0
+    yaw: float = 0.0     # heading in ego frame [rad], rotation around z-axis
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +139,21 @@ def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
     hw, hl, hh = obj.width / 2.0, obj.length / 2.0, obj.height / 2.0
     cx, cy, cz = obj.x, obj.y, obj.z
 
-    # 8 corners of the axis-aligned bounding box in ego frame
+    # 8 corners of the rotated bounding box in ego frame.
+    # body-x (forward) = length direction, body-y (lateral) = width direction.
+    # Rotation around ego z-axis by yaw:  ego = R(yaw) * body
+    #   body-x unit in ego: ( cos(yaw),  sin(yaw), 0)
+    #   body-y unit in ego: (-sin(yaw),  cos(yaw), 0)
+    import math as _math
+    c, s = _math.cos(obj.yaw), _math.sin(obj.yaw)
     corners = [
-        (cx + dx * hw, cy + dy * hl, cz + dz * hh)
-        for dx in (-1.0, 1.0)
-        for dy in (-1.0, 1.0)
+        (
+            cx + lx * c - ly * s,
+            cy + lx * s + ly * c,
+            cz + dz * hh,
+        )
+        for lx in (-hl, hl)   # along length (body-x)
+        for ly in (-hw, hw)   # along width  (body-y)
         for dz in (-1.0, 1.0)
     ]
 
@@ -477,14 +488,19 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
     view_xlim = None
     view_ylim = None
     if target_objects:
+        import math as _math
         xs_min, xs_max, ys_min, ys_max = [], [], [], []
         for obj in target_objects:
             hw = obj.width  / 2.0 if obj.width  > 0 else 0.0
             hl = obj.length / 2.0 if obj.length > 0 else 0.0
-            xs_min.append(obj.x - hw)
-            xs_max.append(obj.x + hw)
-            ys_min.append(obj.y - hl)
-            ys_max.append(obj.y + hl)
+            # AABB of the rotated box
+            c, s = abs(_math.cos(obj.yaw)), abs(_math.sin(obj.yaw))
+            half_x = c * hl + s * hw   # AABB half-extent along ego-x
+            half_y = s * hl + c * hw   # AABB half-extent along ego-y
+            xs_min.append(obj.x - half_x)
+            xs_max.append(obj.x + half_x)
+            ys_min.append(obj.y - half_y)
+            ys_max.append(obj.y + half_y)
         x_lo = min(xs_min) - MARGIN
         x_hi = max(xs_max) + MARGIN
         y_lo = min(ys_min) - MARGIN
@@ -514,16 +530,32 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
             pass
 
     if target_objects:
+        import math as _math
         for obj in target_objects:
             if obj.width > 0 and obj.length > 0:
-                half_w, half_l = obj.width / 2.0, obj.length / 2.0
-                rect = patches.Rectangle(
-                    (obj.x - half_w, obj.y - half_l),
-                    obj.width, obj.length,
+                hl, hw = obj.length / 2.0, obj.width / 2.0
+                c, s = _math.cos(obj.yaw), _math.sin(obj.yaw)
+                # 4 corners in body frame (lx=length-axis, ly=width-axis)
+                # mapped to ego frame: ego = R(yaw) * body
+                corners = np.array([
+                    [obj.x + lx * c - ly * s, obj.y + lx * s + ly * c]
+                    for lx, ly in ((hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw))
+                ])
+                poly = patches.Polygon(
+                    corners, closed=True,
                     linewidth=2.0, edgecolor="yellow", facecolor="none",
                     linestyle="--", zorder=6,
                 )
-                ax.add_patch(rect)
+                ax.add_patch(poly)
+                # Heading arrow: center → front midpoint
+                front_mid = np.array([obj.x + hl * c, obj.y + hl * s])
+                ax.annotate(
+                    "",
+                    xy=(front_mid[0], front_mid[1]),
+                    xytext=(obj.x, obj.y),
+                    arrowprops=dict(arrowstyle="->", color="red", lw=1.5),
+                    zorder=7,
+                )
             ax.annotate(
                 f"{obj.label or 'target'}\n({obj.x:.1f},{obj.y:.1f})",
                 (obj.x, obj.y),
