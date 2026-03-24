@@ -18,6 +18,9 @@ Optional columns (used when present)
                        without a status (or with NaN) go into "unknown"
 - ``cameras``        : comma-separated camera channel names to render
 - ``description``    : free-text label added to plot titles
+- ``label``          : string label for the target object (e.g. "car", "pedestrian");
+                       when present, it is prepended to the output filename so that
+                       results can be distinguished at a glance
 
 One row = one annotated object.  Rows are grouped by
 ``(t4dataset_id, scenario_name, frame_index)`` to produce one visualization
@@ -25,9 +28,11 @@ per unique frame.
 
 Output structure
 -----------------
-    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_cameras.png
-    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_pointcloud.png
-    <output_dir>/<status>/<t4dataset_id>_<scenario_name>_f<frame_index>_meta.txt
+    <output_dir>/<status>/<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_cameras.png
+    <output_dir>/<status>/<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_pointcloud.png
+    <output_dir>/<status>/<label>_<t4dataset_id>_<scenario_name>_f<frame_index>_meta.txt
+
+``<label>_`` is omitted when the ``label`` column is absent or empty.
 
 Storage modes
 --------------
@@ -149,6 +154,7 @@ def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
     has_width = "width" in df.columns
     has_length = "length" in df.columns
     has_height = "height" in df.columns
+    has_yaw = "yaw" in df.columns
 
     for _, r in df.iterrows():
         key: FrameKey = (
@@ -200,6 +206,7 @@ def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
                     width=float(r["width"]) if has_width and pd.notna(r.get("width")) else 0.0,
                     length=float(r["length"]) if has_length and pd.notna(r.get("length")) else 0.0,
                     height=float(r["height"]) if has_height and pd.notna(r.get("height")) else 0.0,
+                    yaw=float(r["yaw"]) if has_yaw and pd.notna(r.get("yaw")) else 0.0,
                 ))
 
     return list(seen.values())
@@ -243,18 +250,26 @@ def resolve_dataset_path(
     t4dataset_id: str,
     data_dir: Path,
     do_download: bool,
+    cache_limit: int = 0,
 ) -> Path:
-    """Return the local path to a dataset, downloading it first if needed."""
-    from t4_visualizer.downloader import download_dataset, DownloadError
+    """Return the local path to a dataset, downloading it first if needed.
+
+    When *cache_limit* > 0 a :class:`DatasetCache` is used so that the
+    least-recently-used datasets are evicted once the limit is reached.
+    """
+    from t4_visualizer.downloader import DatasetCache, DownloadError, dataset_is_cached
 
     if do_download:
-        return download_dataset(t4dataset_id, data_dir)
+        cache = DatasetCache(data_dir, max_cached=cache_limit)
+        return cache.ensure(t4dataset_id)
     else:
         path = data_dir / t4dataset_id
         if not path.exists():
             raise FileNotFoundError(
                 f"Dataset not found at {path} and --no-download was specified."
             )
+        # Still update the access timestamp so the cache knows it was used
+        DatasetCache(data_dir, max_cached=0).touch(t4dataset_id)
         return path
 
 
@@ -269,9 +284,20 @@ def _status_dir(output_root: Path, status: Optional[str], has_status_column: boo
 
 
 def _filename_prefix(frame: FrameRow) -> str:
-    """Build flat filename prefix: <t4dataset_id>_<scenario_name>_f<frame_index>."""
+    """Build flat filename prefix.
+
+    Format: <label>_<t4dataset_id>_<scenario_name>_f<frame_index>
+    The <label>_ part is omitted when no target object carries a label.
+    """
     safe = lambda s: str(s).replace("/", "-").replace(" ", "_")
-    return f"{safe(frame.t4dataset_id)}_{safe(frame.scenario_name)}_f{frame.frame_index:06d}"
+    base = f"{safe(frame.t4dataset_id)}_{safe(frame.scenario_name)}_f{frame.frame_index:06d}"
+    obj_label = next(
+        (obj.label for obj in frame.target_objects if obj.label),
+        "",
+    )
+    if obj_label:
+        return f"{safe(obj_label)}_{base}"
+    return base
 
 
 def visualize_frame(
@@ -281,6 +307,9 @@ def visualize_frame(
     show_annotations: bool = True,
     version: Optional[str] = None,
     has_status_column: bool = False,
+    crop_cameras: bool = False,
+    crop_padding: int = 40,
+    crop_min_size: int = 300,
 ) -> Path:
     """Visualize one frame. Returns the output directory used."""
     try:
@@ -338,6 +367,9 @@ def visualize_frame(
         save_dir=str(frame_out),
         filename_prefix=prefix,
         target_objects=frame.target_objects,
+        crop_cameras=crop_cameras,
+        crop_padding=crop_padding,
+        crop_min_size=crop_min_size,
     )
 
     return frame_out
@@ -359,6 +391,10 @@ class BatchConfig:
     version: Optional[str]
     workers: int
     fail_fast: bool
+    crop_cameras: bool = False
+    crop_padding: int = 40
+    crop_min_size: int = 300
+    cache_limit: int = 10
 
 
 def run_batch(cfg: BatchConfig) -> List[RowResult]:
@@ -409,7 +445,8 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
         dataset_paths: Dict[str, Path] = {}
         for did in unique_ids:
             try:
-                path = resolve_dataset_path(did, data_dir, cfg.do_download)
+                path = resolve_dataset_path(did, data_dir, cfg.do_download,
+                                            cache_limit=cfg.cache_limit)
                 dataset_paths[did] = path
                 print(f"  Dataset ready: {did} → {path}")
             except Exception as e:
@@ -433,6 +470,9 @@ def run_batch(cfg: BatchConfig) -> List[RowResult]:
                     show_annotations=cfg.show_annotations,
                     version=cfg.version,
                     has_status_column=has_status_column,
+                    crop_cameras=cfg.crop_cameras,
+                    crop_padding=cfg.crop_padding,
+                    crop_min_size=cfg.crop_min_size,
                 )
                 return RowResult(frame=frame, success=True, output_dir=out)
             except Exception as e:
@@ -598,6 +638,42 @@ def parse_args():
         default=False,
         help="Abort the batch on the first error instead of continuing.",
     )
+    parser.add_argument(
+        "--cache-limit",
+        type=int,
+        default=10,
+        metavar="N",
+        dest="cache_limit",
+        help=(
+            "Maximum number of datasets to keep on disk (LRU eviction). "
+            "0 disables eviction (default: 10)."
+        ),
+    )
+    parser.add_argument(
+        "--crop-view",
+        action="store_true",
+        default=False,
+        dest="crop_cameras",
+        help=(
+            "Replace the full camera grid with a single cropped view of the "
+            "camera showing the largest projected BBOX ROI. "
+            "Output file: {prefix}_visualization_crop.png."
+        ),
+    )
+    parser.add_argument(
+        "--crop-padding",
+        type=int,
+        default=40,
+        metavar="PX",
+        help="Pixel padding around the ROI crop (default: 40).",
+    )
+    parser.add_argument(
+        "--crop-min-size",
+        type=int,
+        default=300,
+        metavar="PX",
+        help="Minimum crop dimension in pixels (default: 300).",
+    )
 
     return parser.parse_args()
 
@@ -616,6 +692,10 @@ def main():
         version=args.version,
         workers=args.workers,
         fail_fast=args.fail_fast,
+        crop_cameras=args.crop_cameras,
+        crop_padding=args.crop_padding,
+        crop_min_size=args.crop_min_size,
+        cache_limit=args.cache_limit,
     )
 
     results = run_batch(cfg)
@@ -626,4 +706,277 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if "--multi" in _sys.argv:
+        _sys.argv.remove("--multi")
+        multi_main()
+    else:
+        main()
+
+
+# ===========================================================================
+# Multi-CSV batch
+# ===========================================================================
+
+@dataclass
+class RunSpec:
+    """One CSV input with its output label."""
+    label: str       # output subfolder name, e.g. "improve"
+    input_path: str  # path to CSV / Parquet file
+
+
+@dataclass
+class MultiRunConfig:
+    """Configuration for a multi-CSV batch run."""
+    runs: List[RunSpec]
+    output_dir: Path
+    data_dir: Optional[Path]
+    use_temp: bool
+    do_download: bool
+    yes: bool
+    show_annotations: bool
+    version: Optional[str]
+    workers: int
+    fail_fast: bool
+    crop_cameras: bool = False
+    crop_padding: int = 40
+    crop_min_size: int = 300
+    cache_limit: int = 10
+
+
+def _parse_run_spec(s: str) -> RunSpec:
+    """Parse ``'label:path'`` or ``'path'`` (label = file stem)."""
+    if ":" in s:
+        label, _, path = s.partition(":")
+        return RunSpec(label=label.strip(), input_path=path.strip())
+    return RunSpec(label=Path(s).stem, input_path=s)
+
+
+def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
+    """Three-phase multi-CSV pipeline.
+
+    Phase 1 — Load all CSVs and collect the union of required dataset IDs.
+    Phase 2 — Download all datasets once (``DatasetCache.ensure_many``).
+              Non-needed LRU entries are evicted first so the needed set is
+              never sacrificed mid-run.
+    Phase 3 — Visualize each CSV independently, routing output to
+              ``output_dir / label /``.
+    """
+    # ------------------------------------------------------------------
+    # Validate labels
+    # ------------------------------------------------------------------
+    labels = [spec.label for spec in cfg.runs]
+    dupes = {l for l in labels if labels.count(l) > 1}
+    if dupes:
+        raise ValueError(f"Duplicate run labels: {sorted(dupes)}")
+
+    # ------------------------------------------------------------------
+    # Phase 1: load all CSVs
+    # ------------------------------------------------------------------
+    all_run_data: List[tuple] = []   # (label, frames, has_status)
+    ids_ordered: List[str] = []      # unique IDs, insertion order
+    seen_ids: set = set()
+
+    for spec in cfg.runs:
+        print(f"\nLoading [{spec.label}]: {spec.input_path}")
+        df = load_input(spec.input_path)
+        has_status = "status" in df.columns
+        frames = df_to_frames(df)
+        print(f"  {len(df)} rows → {len(frames)} frame(s)")
+        all_run_data.append((spec.label, frames, has_status))
+        for f in frames:
+            if f.t4dataset_id not in seen_ids:
+                ids_ordered.append(f.t4dataset_id)
+                seen_ids.add(f.t4dataset_id)
+
+    print(f"\n{len(ids_ordered)} unique dataset(s) across all runs:")
+    for did in ids_ordered:
+        print(f"  {did}")
+
+    # ------------------------------------------------------------------
+    # Confirmation
+    # ------------------------------------------------------------------
+    if cfg.do_download and not cfg.yes:
+        all_frames = [f for _, frames, _ in all_run_data for f in frames]
+        if not confirm_downloads(all_frames):
+            print("Download cancelled by user.")
+            sys.exit(0)
+
+    # ------------------------------------------------------------------
+    # Phase 2: setup data dir + smart download
+    # ------------------------------------------------------------------
+    _tmp_ctx = None
+    if cfg.use_temp:
+        _tmp_ctx = tempfile.TemporaryDirectory(prefix="t4multi_")
+        data_dir = Path(_tmp_ctx.name)
+        print(f"\n  Using TEMP directory: {data_dir}")
+    else:
+        data_dir = cfg.data_dir or Path("t4datasets")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n  Data directory: {data_dir.resolve()}")
+
+    try:
+        from t4_visualizer.downloader import DatasetCache
+        cache = DatasetCache(data_dir, cfg.cache_limit)
+        dataset_paths: Dict[str, Path] = {}
+
+        if cfg.do_download:
+            try:
+                dataset_paths = cache.ensure_many(ids_ordered)
+            except Exception as e:
+                print(f"  ERROR during batch download: {e}")
+                if cfg.fail_fast:
+                    raise
+                # Fallback: try each ID individually
+                for did in ids_ordered:
+                    try:
+                        dataset_paths[did] = cache.ensure(did)
+                    except Exception as e2:
+                        print(f"  ERROR downloading {did}: {e2}")
+        else:
+            for did in ids_ordered:
+                path = data_dir / did
+                if path.exists():
+                    cache.touch(did)
+                    dataset_paths[did] = path
+                else:
+                    msg = f"Dataset not found at {path} (--no-download)"
+                    print(f"  ERROR: {msg}")
+                    if cfg.fail_fast:
+                        raise FileNotFoundError(msg)
+
+        # ------------------------------------------------------------------
+        # Phase 3: visualize each run
+        # ------------------------------------------------------------------
+        all_results: Dict[str, List[RowResult]] = {}
+
+        for label, frames, has_status in all_run_data:
+            print(f"\n{'='*60}")
+            print(f"  Visualizing [{label}]  ({len(frames)} frame(s))")
+            print(f"{'='*60}")
+
+            label_output = cfg.output_dir / label
+            label_output.mkdir(parents=True, exist_ok=True)
+
+            ok_frames = [f for f in frames if f.t4dataset_id in dataset_paths]
+            skip_frames = [f for f in frames if f.t4dataset_id not in dataset_paths]
+
+            def _process(frame: FrameRow) -> RowResult:
+                dataset_path = dataset_paths[frame.t4dataset_id]
+                try:
+                    out = visualize_frame(
+                        frame, dataset_path, label_output,
+                        show_annotations=cfg.show_annotations,
+                        version=cfg.version,
+                        has_status_column=has_status,
+                        crop_cameras=cfg.crop_cameras,
+                        crop_padding=cfg.crop_padding,
+                        crop_min_size=cfg.crop_min_size,
+                    )
+                    return RowResult(frame=frame, success=True, output_dir=out)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(f"  ERROR [{frame.scenario_name} / frame {frame.frame_index}]: "
+                          f"{e}\n{tb}")
+                    if cfg.fail_fast:
+                        raise
+                    return RowResult(frame=frame, success=False, error=str(e))
+
+            if cfg.workers > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
+                    results = list(pool.map(_process, ok_frames))
+            else:
+                results = [_process(f) for f in ok_frames]
+
+            results += [
+                RowResult(frame=f, success=False, error="dataset not available")
+                for f in skip_frames
+            ]
+            all_results[label] = results
+            print_summary(results, label_output)
+
+        return all_results
+
+    finally:
+        if _tmp_ctx:
+            _tmp_ctx.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# t4-multi CLI
+# ---------------------------------------------------------------------------
+
+def _parse_multi_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="t4-multi",
+        description=(
+            "Visualize multiple CSV/Parquet result files in one run.\n"
+            "Each CSV is assigned a label that becomes its output subfolder.\n\n"
+            "Examples:\n"
+            "  t4-multi improve:improve.csv degrade:degrade.csv -o ./viz\n"
+            "  t4-multi improve.csv degrade.csv -o ./viz   # label = file stem"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "runs",
+        nargs="+",
+        metavar="[LABEL:]CSV",
+        help=(
+            "One or more CSV/Parquet files.  Prefix with 'label:' to set the "
+            "output folder name; otherwise the file stem is used."
+        ),
+    )
+    parser.add_argument("-o", "--output-dir", default="./output", metavar="DIR")
+    parser.add_argument("--data-dir", default=None, metavar="PATH",
+                        help="Persistent dataset cache directory (default: ./t4datasets).")
+    parser.add_argument("--no-download", action="store_true", default=False)
+    parser.add_argument("--temp", action="store_true", default=False)
+    parser.add_argument("-y", "--yes", action="store_true", default=False)
+    parser.add_argument("--no-annotations", action="store_false", dest="show_annotations",
+                        default=True)
+    parser.add_argument("--version", default=None, metavar="VERSION")
+    parser.add_argument("--workers", "-j", type=int, default=1, metavar="N")
+    parser.add_argument("--fail-fast", action="store_true", default=False)
+    parser.add_argument("--cache-limit", type=int, default=10, metavar="N",
+                        help="Max datasets on disk (LRU eviction). 0=unlimited.")
+    parser.add_argument("--crop-view", action="store_true", default=False,
+                        dest="crop_cameras")
+    parser.add_argument("--crop-padding", type=int, default=40, metavar="PX")
+    parser.add_argument("--crop-min-size", type=int, default=300, metavar="PX")
+
+    return parser.parse_args()
+
+
+def multi_main():
+    """Entry point for the ``t4-multi`` command."""
+    args = _parse_multi_args()
+
+    runs = [_parse_run_spec(s) for s in args.runs]
+
+    cfg = MultiRunConfig(
+        runs=runs,
+        output_dir=Path(args.output_dir),
+        data_dir=Path(args.data_dir) if args.data_dir else None,
+        use_temp=args.temp,
+        do_download=not args.no_download,
+        yes=args.yes,
+        show_annotations=args.show_annotations,
+        version=args.version,
+        workers=args.workers,
+        fail_fast=args.fail_fast,
+        crop_cameras=args.crop_cameras,
+        crop_padding=args.crop_padding,
+        crop_min_size=args.crop_min_size,
+        cache_limit=args.cache_limit,
+    )
+
+    all_results = multi_run(cfg)
+
+    total_fail = sum(
+        1 for results in all_results.values() for r in results if not r.success
+    )
+    sys.exit(1 if total_fail > 0 else 0)

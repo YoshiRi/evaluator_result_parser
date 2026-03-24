@@ -37,6 +37,8 @@ from typing import List, Optional, Set
 
 import numpy as np
 
+_VISIBILITY_TIER_THRESHOLD = 0.5  # ROIs with visibility below this are deprioritised
+
 
 @dataclass
 class TargetObject:
@@ -49,6 +51,7 @@ class TargetObject:
     width: float = 0.0   # BBOX dimensions in ego frame [m]
     length: float = 0.0
     height: float = 0.0
+    yaw: float = 0.0     # heading in ego frame [rad], rotation around z-axis
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +123,12 @@ def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
                           img_w: int, img_h: int) -> Optional[tuple]:
     """Project the 8 corners of a detection BBOX onto a camera image.
 
-    Returns (u_min, v_min, u_max, v_max) clipped to the image bounds,
-    or None if no corner projects in front of the camera or the
+    Returns (u_min, v_min, u_max, v_max, visibility) clipped to the image
+    bounds, or None if no corner projects in front of the camera or the
     resulting ROI is empty / fully outside the image.
+
+    ``visibility`` is the ratio of clipped area to raw projected area
+    (0.0–1.0); 1.0 means the entire BBOX projection is within the image.
 
     Only corners with z > 0 in camera frame are used, so the result is a
     safe under-estimate when the box straddles the image plane.
@@ -133,11 +139,21 @@ def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
     hw, hl, hh = obj.width / 2.0, obj.length / 2.0, obj.height / 2.0
     cx, cy, cz = obj.x, obj.y, obj.z
 
-    # 8 corners of the axis-aligned bounding box in ego frame
+    # 8 corners of the rotated bounding box in ego frame.
+    # body-x (forward) = length direction, body-y (lateral) = width direction.
+    # Rotation around ego z-axis by yaw:  ego = R(yaw) * body
+    #   body-x unit in ego: ( cos(yaw),  sin(yaw), 0)
+    #   body-y unit in ego: (-sin(yaw),  cos(yaw), 0)
+    import math as _math
+    c, s = _math.cos(obj.yaw), _math.sin(obj.yaw)
     corners = [
-        (cx + dx * hw, cy + dy * hl, cz + dz * hh)
-        for dx in (-1.0, 1.0)
-        for dy in (-1.0, 1.0)
+        (
+            cx + lx * c - ly * s,
+            cy + lx * s + ly * c,
+            cz + dz * hh,
+        )
+        for lx in (-hl, hl)   # along length (body-x)
+        for ly in (-hw, hw)   # along width  (body-y)
         for dz in (-1.0, 1.0)
     ]
 
@@ -165,7 +181,14 @@ def _project_bbox_to_roi(t4, sample_data_token: str, obj: "TargetObject",
     if u_max - u_min < 2 or v_max - v_min < 2:
         return None
 
-    return (u_min, v_min, u_max, v_max)
+    raw_area = (u_max_raw - u_min_raw) * (v_max_raw - v_min_raw)
+    if raw_area > 0:
+        clipped_area = (u_max - u_min) * (v_max - v_min)
+        visibility = clipped_area / raw_area
+    else:
+        visibility = 1.0
+
+    return (u_min, v_min, u_max, v_max, visibility)
 
 
 def _get_target_ann_tokens(t4, sample, target_objects: List[TargetObject]) -> Set[str]:
@@ -281,6 +304,9 @@ def visualize_static(
     save_dir: Optional[str] = None,
     filename_prefix: Optional[str] = None,
     target_objects: Optional[List[TargetObject]] = None,
+    crop_cameras: bool = False,
+    crop_padding: int = 40,
+    crop_min_size: int = 300,
 ) -> None:
     """Render images and a bird's-eye-view point cloud with matplotlib.
 
@@ -291,8 +317,11 @@ def visualize_static(
         show_annotations: Overlay 2D/3D bounding boxes on images.
         save_dir: If given, save figures here instead of showing interactively.
         filename_prefix: Prefix for saved filenames (default: timestamp).
-            E.g. "datasetA_sceneX_1609459200000000" produces
-            "datasetA_sceneX_1609459200000000_cameras.png".
+        crop_cameras: If True, replace the full camera grid with a single
+            cropped view of the camera showing the largest projected BBOX ROI.
+            Output filename becomes ``{prefix}_visualization_crop.png``.
+        crop_padding: Pixels of padding around the ROI (default 40).
+        crop_min_size: Minimum crop dimension in pixels (default 300).
     """
     import matplotlib
     if save_dir:
@@ -322,6 +351,9 @@ def visualize_static(
     _plot_combined(
         t4, sample, selected_cameras, lidar_channel, show_annotations,
         save_dir, prefix, target_ann_tokens, target_objects or [],
+        crop_cameras=crop_cameras,
+        crop_padding=crop_padding,
+        crop_min_size=crop_min_size,
     )
 
     if not save_dir:
@@ -383,7 +415,7 @@ def _fill_camera_axes(t4, sample, camera_channels, show_annotations, axes,
                 # Try full 3D BBOX → 2D ROI first
                 det_roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
                 if det_roi is not None:
-                    u_min, v_min, u_max, v_max = det_roi
+                    u_min, v_min, u_max, v_max, *_ = det_roi
                     bw, bh = u_max - u_min, v_max - v_min
                     rect = patches.Rectangle(
                         (u_min, v_min), bw, bh,
@@ -456,14 +488,19 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
     view_xlim = None
     view_ylim = None
     if target_objects:
+        import math as _math
         xs_min, xs_max, ys_min, ys_max = [], [], [], []
         for obj in target_objects:
             hw = obj.width  / 2.0 if obj.width  > 0 else 0.0
             hl = obj.length / 2.0 if obj.length > 0 else 0.0
-            xs_min.append(obj.x - hw)
-            xs_max.append(obj.x + hw)
-            ys_min.append(obj.y - hl)
-            ys_max.append(obj.y + hl)
+            # AABB of the rotated box
+            c, s = abs(_math.cos(obj.yaw)), abs(_math.sin(obj.yaw))
+            half_x = c * hl + s * hw   # AABB half-extent along ego-x
+            half_y = s * hl + c * hw   # AABB half-extent along ego-y
+            xs_min.append(obj.x - half_x)
+            xs_max.append(obj.x + half_x)
+            ys_min.append(obj.y - half_y)
+            ys_max.append(obj.y + half_y)
         x_lo = min(xs_min) - MARGIN
         x_hi = max(xs_max) + MARGIN
         y_lo = min(ys_min) - MARGIN
@@ -493,16 +530,32 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
             pass
 
     if target_objects:
+        import math as _math
         for obj in target_objects:
             if obj.width > 0 and obj.length > 0:
-                half_w, half_l = obj.width / 2.0, obj.length / 2.0
-                rect = patches.Rectangle(
-                    (obj.x - half_w, obj.y - half_l),
-                    obj.width, obj.length,
+                hl, hw = obj.length / 2.0, obj.width / 2.0
+                c, s = _math.cos(obj.yaw), _math.sin(obj.yaw)
+                # 4 corners in body frame (lx=length-axis, ly=width-axis)
+                # mapped to ego frame: ego = R(yaw) * body
+                corners = np.array([
+                    [obj.x + lx * c - ly * s, obj.y + lx * s + ly * c]
+                    for lx, ly in ((hl, hw), (hl, -hw), (-hl, -hw), (-hl, hw))
+                ])
+                poly = patches.Polygon(
+                    corners, closed=True,
                     linewidth=2.0, edgecolor="yellow", facecolor="none",
                     linestyle="--", zorder=6,
                 )
-                ax.add_patch(rect)
+                ax.add_patch(poly)
+                # Heading arrow: center → front midpoint
+                front_mid = np.array([obj.x + hl * c, obj.y + hl * s])
+                ax.annotate(
+                    "",
+                    xy=(front_mid[0], front_mid[1]),
+                    xytext=(obj.x, obj.y),
+                    arrowprops=dict(arrowstyle="->", color="red", lw=1.5),
+                    zorder=7,
+                )
             ax.annotate(
                 f"{obj.label or 'target'}\n({obj.x:.1f},{obj.y:.1f})",
                 (obj.x, obj.y),
@@ -520,21 +573,191 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
         ax.set_ylim(view_ylim)
 
 
+def _group_objects_by_camera(t4, sample, camera_channels, target_objects):
+    """Map each target object to its best-scoring camera, then group by camera.
+
+    For each object the best camera is chosen with the same (tier, area) score
+    used previously in _find_largest_roi_camera.
+
+    Returns a list of (channel, token, obj_roi_pairs, img_w, img_h) where
+    obj_roi_pairs is [(obj, roi), ...] for all objects whose best camera is
+    this channel.  Objects that are not visible in any camera are omitted.
+    The list is ordered by descending total clipped area so the "most
+    interesting" camera comes first.
+    """
+    from PIL import Image as PILImage
+
+    # Cache (token, img_w, img_h) per channel to avoid re-opening images.
+    cam_info: dict = {}
+    for channel in camera_channels:
+        token = sample.data.get(channel)
+        if token is None:
+            continue
+        try:
+            data_path, _, _ = t4.get_sample_data(token, as_3d=False)
+            with PILImage.open(data_path) as img:
+                img_w, img_h = img.size
+            cam_info[channel] = (token, img_w, img_h)
+        except Exception:
+            continue
+
+    # For each object find the best (channel, roi).
+    obj_best: dict = {}  # obj_idx -> (channel, roi, tier, area)
+    for obj_idx, obj in enumerate(target_objects):
+        for channel, (token, img_w, img_h) in cam_info.items():
+            roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
+            if roi is None:
+                continue
+            u_min, v_min, u_max, v_max, visibility = roi
+            area = (u_max - u_min) * (v_max - v_min)
+            tier = 1 if visibility >= _VISIBILITY_TIER_THRESHOLD else 0
+            prev = obj_best.get(obj_idx)
+            if prev is None or (tier, area) > (prev[2], prev[3]):
+                obj_best[obj_idx] = (channel, roi, tier, area)
+
+    # Group objects by their best camera.
+    groups: dict = {}  # channel -> [(obj, roi), ...]
+    for obj_idx, (channel, roi, _, _) in obj_best.items():
+        groups.setdefault(channel, []).append((target_objects[obj_idx], roi))
+
+    # Build result sorted by total clipped area descending.
+    result = []
+    for channel, obj_roi_pairs in groups.items():
+        token, img_w, img_h = cam_info[channel]
+        total_area = sum(
+            (r[2] - r[0]) * (r[3] - r[1]) for _, r in obj_roi_pairs
+        )
+        result.append((channel, token, obj_roi_pairs, img_w, img_h, total_area))
+    result.sort(key=lambda x: x[5], reverse=True)
+    return [(ch, tok, pairs, w, h) for ch, tok, pairs, w, h, _ in result]
+
+
+def _compute_crop_limits(roi, img_w, img_h, padding: int, min_size: int):
+    """Expand ROI by padding, enforce min_size, clamp to image bounds.
+
+    Returns (x0, x1, y0, y1) in image-pixel coordinates (y increases down).
+    """
+    u_min, v_min, u_max, v_max, *_ = roi
+
+    u0 = max(0.0, u_min - padding)
+    u1 = min(float(img_w), u_max + padding)
+    v0 = max(0.0, v_min - padding)
+    v1 = min(float(img_h), v_max + padding)
+
+    # Enforce minimum width
+    if u1 - u0 < min_size:
+        cx = (u0 + u1) / 2.0
+        u0 = max(0.0, cx - min_size / 2.0)
+        u1 = min(float(img_w), u0 + min_size)
+        u0 = max(0.0, u1 - min_size)   # re-clamp if hit right edge
+
+    # Enforce minimum height
+    if v1 - v0 < min_size:
+        cy = (v0 + v1) / 2.0
+        v0 = max(0.0, cy - min_size / 2.0)
+        v1 = min(float(img_h), v0 + min_size)
+        v0 = max(0.0, v1 - min_size)
+
+    return u0, u1, v0, v1
+
+
 def _plot_combined(t4, sample, camera_channels, lidar_channel, show_annotations,
-                   save_dir, filename_prefix, target_ann_tokens, target_objects):
-    """Single figure combining camera grid (left) and BEV point cloud (right)."""
+                   save_dir, filename_prefix, target_ann_tokens, target_objects,
+                   crop_cameras: bool = False,
+                   crop_padding: int = 40,
+                   crop_min_size: int = 300):
+    """Single figure combining camera grid (left) and BEV point cloud (right).
+
+    When crop_cameras=True the camera panel is replaced by a single cropped
+    view of whichever camera shows the largest projected BBOX ROI.
+    """
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
 
+    has_lidar = lidar_channel is not None
+    ts_us = sample.timestamp
+
+    # ------------------------------------------------------------------
+    # Crop-camera mode: one [cropped camera | BEV] figure per camera group
+    # ------------------------------------------------------------------
+    if crop_cameras and target_objects:
+        cam_groups = _group_objects_by_camera(
+            t4, sample, camera_channels, target_objects
+        )
+        if cam_groups:
+            prefix = filename_prefix if filename_prefix else str(ts_us)
+            if save_dir:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+            for channel, token, obj_roi_pairs, img_w, img_h in cam_groups:
+                # Merge all object ROIs for this camera into one crop region.
+                merged_roi = (
+                    min(r[0] for _, r in obj_roi_pairs),
+                    min(r[1] for _, r in obj_roi_pairs),
+                    max(r[2] for _, r in obj_roi_pairs),
+                    max(r[3] for _, r in obj_roi_pairs),
+                )
+                x0, x1, y0, y1 = _compute_crop_limits(
+                    merged_roi, img_w, img_h, crop_padding, crop_min_size
+                )
+                crop_w = x1 - x0
+                crop_h = y1 - y0
+
+                bev_size = 7.0
+                cam_w_in = bev_size * (crop_w / crop_h)
+                fig_w = cam_w_in + bev_size + 0.3
+                fig_h = bev_size + 0.4
+
+                fig = plt.figure(figsize=(fig_w, fig_h))
+                gs = gridspec.GridSpec(
+                    1, 2, figure=fig,
+                    width_ratios=[cam_w_in, bev_size],
+                    hspace=0.05, wspace=0.08,
+                )
+                cam_ax = fig.add_subplot(gs[0, 0])
+                bev_ax = fig.add_subplot(gs[0, 1])
+
+                _fill_camera_axes(
+                    t4, sample, [channel], show_annotations,
+                    [cam_ax], target_ann_tokens,
+                    [obj for obj, _ in obj_roi_pairs],
+                )
+                cam_ax.set_xlim(x0, x1)
+                cam_ax.set_ylim(y1, y0)
+                cam_ax.set_title(f"{channel} [crop]", fontsize=9)
+
+                if has_lidar:
+                    _fill_bev_ax(t4, sample, lidar_channel, show_annotations,
+                                 bev_ax, target_ann_tokens, target_objects)
+
+                fig.suptitle(
+                    f"timestamp: {ts_us} µs  ({ts_us / 1e6:.3f} s)    "
+                    f"token: {sample.token}",
+                    fontsize=9,
+                )
+                fig.tight_layout()
+
+                if save_dir:
+                    out = Path(save_dir) / f"{prefix}_{channel}_visualization_crop.png"
+                    fig.savefig(out, dpi=150, bbox_inches="tight")
+                    print(f"  Saved: {out}")
+                plt.close(fig)
+            return
+
+        # No ROI found in any camera — fall through to standard layout.
+        print("  WARNING: crop_cameras=True but no ROI visible; "
+              "falling back to full camera grid.")
+
+    # ------------------------------------------------------------------
+    # Standard mode: [camera grid | BEV]
+    # ------------------------------------------------------------------
     n_cams = len(camera_channels)
     cam_ncols = min(3, n_cams) if n_cams > 0 else 1
     cam_nrows = max(1, (n_cams + cam_ncols - 1) // cam_ncols)
-    has_lidar = lidar_channel is not None
 
-    # Figure width: camera columns + 1 BEV column (slightly wider)
     bev_col_w = 1.3
     fig_w = cam_ncols * 6 + (7 * bev_col_w if has_lidar else 0)
-    fig_h = cam_nrows * 4 + 0.5   # +0.5 for suptitle
+    fig_h = cam_nrows * 4 + 0.5
 
     if has_lidar:
         fig = plt.figure(figsize=(fig_w, fig_h))
@@ -545,7 +768,7 @@ def _plot_combined(t4, sample, camera_channels, lidar_channel, show_annotations,
         )
         cam_axes = [fig.add_subplot(gs[r, c])
                     for r in range(cam_nrows) for c in range(cam_ncols)]
-        bev_ax = fig.add_subplot(gs[:, cam_ncols])  # span all rows
+        bev_ax = fig.add_subplot(gs[:, cam_ncols])
     else:
         fig = plt.figure(figsize=(fig_w, fig_h))
         gs = gridspec.GridSpec(cam_nrows, cam_ncols, figure=fig,
@@ -562,7 +785,6 @@ def _plot_combined(t4, sample, camera_channels, lidar_channel, show_annotations,
         _fill_bev_ax(t4, sample, lidar_channel, show_annotations,
                      bev_ax, target_ann_tokens, target_objects)
 
-    ts_us = sample.timestamp
     fig.suptitle(
         f"timestamp: {ts_us} µs  ({ts_us / 1e6:.3f} s)    token: {sample.token}",
         fontsize=9,
@@ -587,21 +809,29 @@ def _draw_box_bev(ax, box, highlight: bool = False):
     arrow_color = "red" if highlight else "orange"
     zorder = 4 if highlight else 2
 
-    # box.center: [x, y, z], box.size: [w, l, h], box.rotation: Quaternion
     center = box.center
-    size = box.size  # (w, l, h) or (l, w, h) depending on convention
+    size = box.size
 
-    # Get 4 corners in BEV using the box's rotation
     try:
-        # t4-devkit Box3D corners: shape (3, 8) — top 4 + bottom 4
-        corners = box.corners  # (3, 8)
-        # Use only the bottom 4 corners (indices 4-7) for BEV footprint
-        bev = corners[:2, 4:]  # (2, 4) — x and y of 4 bottom corners
-        xs = np.append(bev[0], bev[0, 0])
-        ys = np.append(bev[1], bev[1, 0])
+        # t4-devkit Box3D.corners() is a METHOD returning shape (8, 3).
+        # Corner layout (x=forward, y=left, z=up), pre-rotation:
+        #   i=0: ( l/2,  w/2,  h/2)  front-left-top
+        #   i=1: ( l/2, -w/2,  h/2)  front-right-top
+        #   i=2: ( l/2, -w/2, -h/2)  front-right-bottom
+        #   i=3: ( l/2,  w/2, -h/2)  front-left-bottom
+        #   i=4: (-l/2,  w/2,  h/2)  rear-left-top
+        #   i=5: (-l/2, -w/2,  h/2)  rear-right-top
+        #   i=6: (-l/2, -w/2, -h/2)  rear-right-bottom
+        #   i=7: (-l/2,  w/2, -h/2)  rear-left-bottom
+        corners = box.corners()  # (8, 3)
+        # BEV polygon: top-face corners in traversal order 0→1→5→4→0
+        #   forms a proper closed rectangle in the xy-plane.
+        poly_xy = corners[[0, 1, 5, 4], :2]  # (4, 2)
+        xs = np.append(poly_xy[:, 0], poly_xy[0, 0])
+        ys = np.append(poly_xy[:, 1], poly_xy[0, 1])
         ax.plot(xs, ys, color=color, linewidth=lw, zorder=zorder)
-        # Draw heading arrow from center to front midpoint
-        front_mid = (bev[:, 0] + bev[:, 1]) / 2
+        # Heading arrow: box centre → midpoint of front edge (avg of 0 and 1)
+        front_mid = (corners[0, :2] + corners[1, :2]) / 2
         ax.annotate(
             "",
             xy=(front_mid[0], front_mid[1]),
@@ -615,8 +845,8 @@ def _draw_box_bev(ax, box, highlight: bool = False):
                 color="yellow", fontsize=7, fontweight="bold",
                 ha="center", va="center", zorder=5,
             )
-    except AttributeError:
-        # Fallback: draw a simple rectangle from center + size
+    except (AttributeError, TypeError):
+        # Fallback: axis-aligned rectangle (rotation ignored)
         w, l = float(size[0]), float(size[1])
         rect = patches.Rectangle(
             (center[0] - w / 2, center[1] - l / 2), w, l,
