@@ -37,6 +37,8 @@ from typing import List, Optional, Set
 
 import numpy as np
 
+_VISIBILITY_TIER_THRESHOLD = 0.5  # ROIs with visibility below this are deprioritised
+
 
 @dataclass
 class TargetObject:
@@ -402,7 +404,7 @@ def _fill_camera_axes(t4, sample, camera_channels, show_annotations, axes,
                 # Try full 3D BBOX → 2D ROI first
                 det_roi = _project_bbox_to_roi(t4, token, obj, img_w, img_h)
                 if det_roi is not None:
-                    u_min, v_min, u_max, v_max = det_roi[:4]
+                    u_min, v_min, u_max, v_max, *_ = det_roi
                     bw, bh = u_max - u_min, v_max - v_min
                     rect = patches.Rectangle(
                         (u_min, v_min), bw, bh,
@@ -550,7 +552,7 @@ def _find_largest_roi_camera(t4, sample, camera_channels, target_objects):
     """
     from PIL import Image as PILImage
 
-    best = None  # (channel, token, roi, score_tier, area, img_w, img_h)
+    best = None
     for channel in camera_channels:
         token = sample.data.get(channel)
         if token is None:
@@ -567,7 +569,7 @@ def _find_largest_roi_camera(t4, sample, camera_channels, target_objects):
                 continue
             u_min, v_min, u_max, v_max, visibility = roi
             area = (u_max - u_min) * (v_max - v_min)
-            tier = 1 if visibility >= 0.5 else 0
+            tier = 1 if visibility >= _VISIBILITY_TIER_THRESHOLD else 0
             if best is None or (tier, area) > (best[3], best[4]):
                 best = (channel, token, roi, tier, area, img_w, img_h)
     if best is None:
@@ -581,7 +583,7 @@ def _compute_crop_limits(roi, img_w, img_h, padding: int, min_size: int):
 
     Returns (x0, x1, y0, y1) in image-pixel coordinates (y increases down).
     """
-    u_min, v_min, u_max, v_max = roi[:4]
+    u_min, v_min, u_max, v_max, *_ = roi
 
     u0 = max(0.0, u_min - padding)
     u1 = min(float(img_w), u_max + padding)
