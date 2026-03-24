@@ -428,8 +428,6 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
     """Render BEV point cloud and detection overlays onto the given axes."""
     import matplotlib.patches as patches
 
-    CROP_RADIUS = 10.0
-
     token = sample.data.get(lidar_channel)
     if token is None:
         print(f"  WARNING: Channel {lidar_channel} not in sample.data")
@@ -452,11 +450,28 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
     y_all = points[:, 1]
     intensity_all = points[:, 3] if points.shape[1] > 3 else np.ones(len(x_all))
 
-    crop_center = None
+    MARGIN = 3.0   # extra space around BBOX extent [m]
+
+    # Compute view extent from all target BBOXes (or fall back to center point)
+    view_xlim = None
+    view_ylim = None
     if target_objects:
-        cx, cy = target_objects[0].x, target_objects[0].y
-        crop_center = (cx, cy)
-        mask = (np.abs(x_all - cx) <= CROP_RADIUS) & (np.abs(y_all - cy) <= CROP_RADIUS)
+        xs_min, xs_max, ys_min, ys_max = [], [], [], []
+        for obj in target_objects:
+            hw = obj.width  / 2.0 if obj.width  > 0 else 0.0
+            hl = obj.length / 2.0 if obj.length > 0 else 0.0
+            xs_min.append(obj.x - hw)
+            xs_max.append(obj.x + hw)
+            ys_min.append(obj.y - hl)
+            ys_max.append(obj.y + hl)
+        x_lo = min(xs_min) - MARGIN
+        x_hi = max(xs_max) + MARGIN
+        y_lo = min(ys_min) - MARGIN
+        y_hi = max(ys_max) + MARGIN
+        view_xlim = (x_lo, x_hi)
+        view_ylim = (y_lo, y_hi)
+        # Crop point cloud to the view region (no need to load points outside)
+        mask = (x_all >= x_lo) & (x_all <= x_hi) & (y_all >= y_lo) & (y_all <= y_hi)
         x, y = x_all[mask], y_all[mask]
         intensity = intensity_all[mask]
     else:
@@ -488,8 +503,6 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
                     linestyle="--", zorder=6,
                 )
                 ax.add_patch(rect)
-            ax.plot(obj.x, obj.y, "*", color="yellow", markersize=16,
-                    markeredgecolor="black", markeredgewidth=0.8, zorder=7)
             ax.annotate(
                 f"{obj.label or 'target'}\n({obj.x:.1f},{obj.y:.1f})",
                 (obj.x, obj.y),
@@ -502,10 +515,9 @@ def _fill_bev_ax(t4, sample, lidar_channel, show_annotations, ax,
     ax.set_aspect("equal")
     ax.set_title(f"LiDAR BEV — {lidar_channel}")
 
-    if crop_center is not None:
-        cx, cy = crop_center
-        ax.set_xlim(cx - CROP_RADIUS, cx + CROP_RADIUS)
-        ax.set_ylim(cy - CROP_RADIUS, cy + CROP_RADIUS)
+    if view_xlim is not None:
+        ax.set_xlim(view_xlim)
+        ax.set_ylim(view_ylim)
 
 
 def _plot_combined(t4, sample, camera_channels, lidar_channel, show_annotations,
