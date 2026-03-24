@@ -706,7 +706,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if "--multi" in _sys.argv:
+        _sys.argv.remove("--multi")
+        multi_main()
+    else:
+        main()
 
 
 # ===========================================================================
