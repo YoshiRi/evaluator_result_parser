@@ -449,10 +449,8 @@ def _try_flatten(root: Path, t4dataset_id: str, dst: Optional[Path] = None) -> b
     return True
 
 
-def _looks_like_t4dataset(path: Path) -> bool:
-    """Heuristic check: does this directory contain T4 annotation files?"""
-    # T4 datasets have an annotation directory (or versioned annotation dir)
-    # containing sample.json / scene.json etc.
+def _is_t4_root(path: Path) -> bool:
+    """Return True if *path* directly contains T4 annotation files."""
     for candidate in [
         path / "annotation",
         *sorted(path.glob("v1.0-*")),
@@ -460,8 +458,61 @@ def _looks_like_t4dataset(path: Path) -> bool:
     ]:
         if (candidate / "sample.json").exists() or (candidate / "scene.json").exists():
             return True
-    # Also accept if sample.json is directly in the path (flat layout)
     return (path / "sample.json").exists() or (path / "scene.json").exists()
+
+
+def _looks_like_t4dataset(path: Path) -> bool:
+    """Return True if *path* contains T4 annotation files (direct or one level nested).
+
+    Handles two webauto download layouts:
+
+    Normal layout::
+
+        path/annotation/sample.json
+
+    Nested layout (extra UUID subdirectory)::
+
+        path/<uuid>/annotation/sample.json
+        path/map/
+    """
+    if _is_t4_root(path):
+        return True
+    # Also accept if an immediate subdirectory is the T4 root (extra UUID nesting).
+    try:
+        for subdir in path.iterdir():
+            if subdir.is_dir() and _is_t4_root(subdir):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def find_t4_root(path: Path) -> Path:
+    """Return the directory that should be passed to ``Tier4()``.
+
+    Resolves two webauto download layouts:
+
+    Normal layout — data directly in *path*::
+
+        path/annotation/...   →  returns path
+
+    Nested layout — extra UUID subdirectory::
+
+        path/<uuid>/annotation/...
+        path/map/             →  returns path/<uuid>/
+
+    Falls back to *path* if neither layout is recognised (lets Tier4
+    raise its own informative error).
+    """
+    if _is_t4_root(path):
+        return path
+    try:
+        for subdir in sorted(path.iterdir()):
+            if subdir.is_dir() and _is_t4_root(subdir):
+                return subdir
+    except OSError:
+        pass
+    return path
 
 
 def _dir_size_mb(path: Path) -> float:

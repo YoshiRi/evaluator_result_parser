@@ -331,10 +331,15 @@ def visualize_frame(
     frame_out.mkdir(parents=True, exist_ok=True)
     prefix = _filename_prefix(frame)
 
+    from t4_visualizer.downloader import find_t4_root
+    t4_root = find_t4_root(dataset_path)
+    if t4_root != dataset_path:
+        print(f"  [batch] Nested layout detected, using T4 root: {t4_root}")
+
     kwargs = {}
     if version:
         kwargs["version"] = version
-    t4 = Tier4(str(dataset_path), **kwargs)
+    t4 = Tier4(str(t4_root), **kwargs)
 
     sample = find_sample_by_scene_and_index(t4, frame.scenario_name, frame.frame_index)
 
