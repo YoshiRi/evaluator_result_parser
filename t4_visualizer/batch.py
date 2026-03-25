@@ -535,13 +535,28 @@ def print_summary(results: List[RowResult], output_dir: Path) -> None:
     print(f"{'='*60}")
 
     if fail:
-        print("\nFailed frames:")
+        # Deduplicate by t4dataset_id for a concise dataset-level view
+        failed_datasets: dict[str, list[str]] = {}
         for r in fail:
-            print(
-                f"  t4dataset_id={r.frame.t4dataset_id}  "
-                f"scenario={r.frame.scenario_name}  "
-                f"frame={r.frame.frame_index}\n    Error: {r.error}"
-            )
+            did = r.frame.t4dataset_id
+            entry = f"scenario={r.frame.scenario_name} frame={r.frame.frame_index}: {r.error}"
+            failed_datasets.setdefault(did, []).append(entry)
+
+        print(f"\nFailed datasets ({len(failed_datasets)} unique):")
+        for did, entries in failed_datasets.items():
+            print(f"  {did}")
+            for e in entries:
+                print(f"    {e}")
+
+        # Write machine-readable list for easy re-runs / debugging
+        failed_path = output_dir / "failed_datasets.txt"
+        with open(failed_path, "w") as fh:
+            for did, entries in failed_datasets.items():
+                fh.write(f"{did}\n")
+                for e in entries:
+                    fh.write(f"  {e}\n")
+                fh.write("\n")
+        print(f"\n  Failed datasets list: {failed_path}")
 
     summary_path = output_dir / "batch_summary.csv"
     summary_df = pd.DataFrame([
@@ -559,7 +574,7 @@ def print_summary(results: List[RowResult], output_dir: Path) -> None:
         for r in results
     ])
     summary_df.to_csv(summary_path, index=False)
-    print(f"\n  Summary CSV: {summary_path}")
+    print(f"  Summary CSV: {summary_path}")
 
 
 # ---------------------------------------------------------------------------

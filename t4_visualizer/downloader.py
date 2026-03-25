@@ -523,17 +523,24 @@ def patch_missing_t4_tables(t4_root: Path) -> None:
     to exist (even if empty), so we create ``[]`` stubs on-the-fly without
     modifying the original data for tables that are known-safe to be empty.
     """
-    # Locate the annotation directory (supports both versioned and flat layouts)
-    ann_dir: Path | None = None
-    if (t4_root / "annotation").is_dir():
-        ann_dir = t4_root / "annotation"
-    else:
-        for d in sorted(t4_root.glob("v1.0-*")):
-            if d.is_dir():
-                ann_dir = d
-                break
+    # Locate annotation directories by searching for `sample.json`, which is
+    # the canonical anchor file for T4 annotation dirs regardless of the
+    # directory name (annotation/, v1.0-trainval/, 1/, etc.).
+    ann_dirs: list[Path] = []
+    for depth1 in [t4_root, *t4_root.iterdir()]:
+        if not depth1.is_dir():
+            continue
+        if (depth1 / "sample.json").exists():
+            ann_dirs.append(depth1)
+            continue
+        try:
+            for depth2 in depth1.iterdir():
+                if depth2.is_dir() and (depth2 / "sample.json").exists():
+                    ann_dirs.append(depth2)
+        except OSError:
+            pass
 
-    if ann_dir is None:
+    if not ann_dirs:
         return
 
     # Tables that are safe to be empty (no entries = valid empty list).
@@ -544,11 +551,12 @@ def patch_missing_t4_tables(t4_root: Path) -> None:
         "visibility.json",
         "lidarseg.json",
     ]
-    for name in SAFE_EMPTY:
-        target = ann_dir / name
-        if not target.exists():
-            print(f"  [t4-patch] Creating empty stub: {target}")
-            target.write_text("[]")
+    for ann_dir in ann_dirs:
+        for name in SAFE_EMPTY:
+            target = ann_dir / name
+            if not target.exists():
+                print(f"  [t4-patch] Creating empty stub: {target}")
+                target.write_text("[]")
 
 
 def _dir_size_mb(path: Path) -> float:
