@@ -515,6 +515,42 @@ def find_t4_root(path: Path) -> Path:
     return path
 
 
+def patch_missing_t4_tables(t4_root: Path) -> None:
+    """Create empty JSON stubs for mandatory T4 tables that are absent on disk.
+
+    Some webauto exports omit tables like ``attribute.json`` when the dataset
+    contains no entries for that table.  ``t4_devkit`` still requires the file
+    to exist (even if empty), so we create ``[]`` stubs on-the-fly without
+    modifying the original data for tables that are known-safe to be empty.
+    """
+    # Locate the annotation directory (supports both versioned and flat layouts)
+    ann_dir: Path | None = None
+    if (t4_root / "annotation").is_dir():
+        ann_dir = t4_root / "annotation"
+    else:
+        for d in sorted(t4_root.glob("v1.0-*")):
+            if d.is_dir():
+                ann_dir = d
+                break
+
+    if ann_dir is None:
+        return
+
+    # Tables that are safe to be empty (no entries = valid empty list).
+    # Structural tables (sample, sensor, calibrated_sensor, …) are NOT listed
+    # here because an empty stub would silently hide real data problems.
+    SAFE_EMPTY = [
+        "attribute.json",
+        "visibility.json",
+        "lidarseg.json",
+    ]
+    for name in SAFE_EMPTY:
+        target = ann_dir / name
+        if not target.exists():
+            print(f"  [t4-patch] Creating empty stub: {target}")
+            target.write_text("[]")
+
+
 def _dir_size_mb(path: Path) -> float:
     """Return total size of a directory tree in megabytes."""
     total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())

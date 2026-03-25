@@ -331,10 +331,11 @@ def visualize_frame(
     frame_out.mkdir(parents=True, exist_ok=True)
     prefix = _filename_prefix(frame)
 
-    from t4_visualizer.downloader import find_t4_root
+    from t4_visualizer.downloader import find_t4_root, patch_missing_t4_tables
     t4_root = find_t4_root(dataset_path)
     if t4_root != dataset_path:
         print(f"  [batch] Nested layout detected, using T4 root: {t4_root}")
+    patch_missing_t4_tables(t4_root)
 
     kwargs = {}
     if version:
