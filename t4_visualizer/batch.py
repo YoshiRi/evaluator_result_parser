@@ -225,17 +225,47 @@ def _unique_datasets(frames: List[FrameRow]) -> List[FrameRow]:
     return list(seen.values())
 
 
-def confirm_downloads(frames: List[FrameRow]) -> bool:
+def confirm_downloads(frames: List[FrameRow], data_dir: Optional[Path] = None) -> bool:
     """Show datasets to be downloaded and ask the user for confirmation.
 
-    Returns True if the user approves, False otherwise.
+    If *data_dir* is given, already-present datasets are listed separately so
+    the user can make an informed go/no-go decision.
+
+    Returns True if the user approves (or nothing needs downloading), False otherwise.
     """
     unique = _unique_datasets(frames)
-    print("\nThe following datasets will be downloaded:")
-    for f in unique:
-        label = f.t4dataset_name if f.t4dataset_name else f.t4dataset_id
-        print(f"  - {label}  (id: {f.t4dataset_id})")
-    print(f"\nTotal: {len(unique)} dataset(s)\n")
+    total = len(unique)
+
+    present: List[FrameRow] = []
+    missing: List[FrameRow] = []
+    if data_dir is not None and data_dir.exists():
+        for f in unique:
+            if (data_dir / f.t4dataset_id).exists():
+                present.append(f)
+            else:
+                missing.append(f)
+    else:
+        missing = list(unique)
+
+    print(f"\nDatasets required for visualization: {total}")
+
+    if present:
+        print(f"\n  Already in {data_dir}  ({len(present)}):")
+        for f in present:
+            label = f.t4dataset_name if f.t4dataset_name else f.t4dataset_id
+            print(f"    [ok] {label}  (id: {f.t4dataset_id})")
+
+    if missing:
+        print(f"\n  Need to download  ({len(missing)}):")
+        for f in missing:
+            label = f.t4dataset_name if f.t4dataset_name else f.t4dataset_id
+            print(f"    [dl] {label}  (id: {f.t4dataset_id})")
+
+    print(f"\n  Summary: {total} total / {len(present)} present / {len(missing)} to download\n")
+
+    if not missing:
+        print("  All datasets already present — skipping download prompt.")
+        return True
 
     try:
         answer = input("Proceed with download? [y/N] ").strip().lower()
@@ -815,15 +845,6 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
         print(f"  {did}")
 
     # ------------------------------------------------------------------
-    # Confirmation
-    # ------------------------------------------------------------------
-    if cfg.do_download and not cfg.yes:
-        all_frames = [f for _, frames, _ in all_run_data for f in frames]
-        if not confirm_downloads(all_frames):
-            print("Download cancelled by user.")
-            sys.exit(0)
-
-    # ------------------------------------------------------------------
     # Phase 2: setup data dir + smart download
     # ------------------------------------------------------------------
     _tmp_ctx = None
@@ -835,6 +856,17 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
         data_dir = cfg.data_dir or Path("t4datasets")
         data_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n  Data directory: {data_dir.resolve()}")
+
+    # ------------------------------------------------------------------
+    # Confirmation (after data_dir is known so we can show present/missing)
+    # ------------------------------------------------------------------
+    if cfg.do_download and not cfg.yes:
+        all_frames = [f for _, frames, _ in all_run_data for f in frames]
+        # For temp dirs nothing is pre-existing, so pass None to skip the check.
+        preview_dir = None if cfg.use_temp else data_dir
+        if not confirm_downloads(all_frames, data_dir=preview_dir):
+            print("Download cancelled by user.")
+            sys.exit(0)
 
     try:
         from t4_visualizer.downloader import DatasetCache
@@ -855,6 +887,14 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
                     except Exception as e2:
                         print(f"  ERROR downloading {did}: {e2}")
         else:
+            present_ids = [did for did in ids_ordered if (data_dir / did).exists()]
+            missing_ids = [did for did in ids_ordered if did not in present_ids]
+            print(
+                f"\n  Dataset summary (--no-download): "
+                f"{len(ids_ordered)} total / "
+                f"{len(present_ids)} present / "
+                f"{len(missing_ids)} missing"
+            )
             for did in ids_ordered:
                 path = data_dir / did
                 if path.exists():
