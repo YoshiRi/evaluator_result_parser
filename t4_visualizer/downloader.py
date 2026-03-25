@@ -422,40 +422,31 @@ def _find_webauto_nested(root: Path, t4dataset_id: str) -> Optional[Path]:
 
 
 def _try_flatten(root: Path, t4dataset_id: str, dst: Optional[Path] = None) -> bool:
-    """Move contents of webauto's versioned dir into *dst* (default: *root*).
+    """Move webauto's versioned directory to *dst*.
 
-    Handles two layouts produced by webauto depending on how ``--asset-dir``
-    was specified:
+    webauto places data at::
 
-    * ``root/annotation_dataset/<uuid>/<version>/``  (new downloads, root = dest_dir)
-    * ``root/annotation_dataset/<uuid>/<version>/``  (old downloads, root = dest_dir/uuid)
+        root/annotation_dataset/<t4dataset_id>/<version>/
 
-    Items are moved into *dst* only if they don't already exist there, so
-    a partially-flattened directory is safe to re-process.  Empty wrapper
-    directories are removed afterwards (best-effort).
+    This function moves that versioned directory to *dst* (default: *root*),
+    then removes the now-empty ``annotation_dataset/<t4dataset_id>/`` wrapper.
 
-    Returns True if any items were moved.
+    Returns True if the directory was moved.
     """
     src = _find_webauto_nested(root, t4dataset_id)
     if src is None:
         return False
     if dst is None:
         dst = root
-    dst.mkdir(parents=True, exist_ok=True)
-    moved = False
-    for item in list(src.iterdir()):
-        target = dst / item.name
-        if not target.exists():
-            print(f"  [downloader] Moving {item.name}  →  {dst}")
-            shutil.move(str(item), str(target))
-            moved = True
-    # Remove now-empty wrapper dirs (annotation_dataset/<uuid>/<version>/ etc.)
-    for d in [src, src.parent, src.parent.parent]:
+    print(f"  [downloader] Moving {src}  →  {dst}")
+    shutil.move(str(src), str(dst))
+    # Remove now-empty wrapper dirs (annotation_dataset/<t4dataset_id>/ etc.)
+    for d in [src.parent, src.parent.parent]:
         try:
             d.rmdir()
         except OSError:
             break
-    return moved
+    return True
 
 
 def _looks_like_t4dataset(path: Path) -> bool:
