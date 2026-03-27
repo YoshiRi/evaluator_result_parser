@@ -216,6 +216,28 @@ def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
 # Download management
 # ---------------------------------------------------------------------------
 
+def find_dataset_in_dir(data_dir: Path, t4dataset_id: str, search_depth: int = 1) -> Optional[Path]:
+    """Return the path to *t4dataset_id* under *data_dir*, or None if not found.
+
+    search_depth=0  →  data_dir/<id>          (flat layout)
+    search_depth=1  →  data_dir/*/<id>  AND   data_dir/<id>  (one sub-level)
+    """
+    # Always check the flat layout first.
+    flat = data_dir / t4dataset_id
+    if flat.exists():
+        return flat
+
+    if search_depth >= 1:
+        for subdir in data_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            candidate = subdir / t4dataset_id
+            if candidate.exists():
+                return candidate
+
+    return None
+
+
 def _unique_datasets(frames: List[FrameRow]) -> List[FrameRow]:
     """Return one representative FrameRow per unique t4dataset_id (for prompts)."""
     seen: Dict[str, FrameRow] = {}
@@ -225,7 +247,11 @@ def _unique_datasets(frames: List[FrameRow]) -> List[FrameRow]:
     return list(seen.values())
 
 
-def confirm_downloads(frames: List[FrameRow], data_dir: Optional[Path] = None) -> bool:
+def confirm_downloads(
+    frames: List[FrameRow],
+    data_dir: Optional[Path] = None,
+    search_depth: int = 1,
+) -> bool:
     """Show datasets to be downloaded and ask the user for confirmation.
 
     If *data_dir* is given, already-present datasets are listed separately so
@@ -240,7 +266,7 @@ def confirm_downloads(frames: List[FrameRow], data_dir: Optional[Path] = None) -
     missing: List[FrameRow] = []
     if data_dir is not None and data_dir.exists():
         for f in unique:
-            if (data_dir / f.t4dataset_id).exists():
+            if find_dataset_in_dir(data_dir, f.t4dataset_id, search_depth) is not None:
                 present.append(f)
             else:
                 missing.append(f)
@@ -793,6 +819,7 @@ class MultiRunConfig:
     crop_padding: int = 40
     crop_min_size: int = 300
     cache_limit: int = 10
+    search_depth: int = 1
 
 
 def _parse_run_spec(s: str) -> RunSpec:
@@ -864,7 +891,7 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
         all_frames = [f for _, frames, _ in all_run_data for f in frames]
         # For temp dirs nothing is pre-existing, so pass None to skip the check.
         preview_dir = None if cfg.use_temp else data_dir
-        if not confirm_downloads(all_frames, data_dir=preview_dir):
+        if not confirm_downloads(all_frames, data_dir=preview_dir, search_depth=cfg.search_depth):
             print("Download cancelled by user.")
             sys.exit(0)
 
@@ -887,8 +914,9 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
                     except Exception as e2:
                         print(f"  ERROR downloading {did}: {e2}")
         else:
-            present_ids = [did for did in ids_ordered if (data_dir / did).exists()]
-            missing_ids = [did for did in ids_ordered if did not in present_ids]
+            found = {did: find_dataset_in_dir(data_dir, did, cfg.search_depth) for did in ids_ordered}
+            present_ids = [did for did, p in found.items() if p is not None]
+            missing_ids = [did for did, p in found.items() if p is None]
             print(
                 f"\n  Dataset summary (--no-download): "
                 f"{len(ids_ordered)} total / "
@@ -896,12 +924,12 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
                 f"{len(missing_ids)} missing"
             )
             for did in ids_ordered:
-                path = data_dir / did
-                if path.exists():
+                path = found[did]
+                if path is not None:
                     cache.touch(did)
                     dataset_paths[did] = path
                 else:
-                    msg = f"Dataset not found at {path} (--no-download)"
+                    msg = f"Dataset '{did}' not found under {data_dir} (search_depth={cfg.search_depth}, --no-download)"
                     print(f"  ERROR: {msg}")
                     if cfg.fail_fast:
                         raise FileNotFoundError(msg)
@@ -995,6 +1023,10 @@ def _parse_multi_args():
     parser.add_argument("--data-dir", default=None, metavar="PATH",
                         help="Persistent dataset cache directory (default: ./t4datasets).")
     parser.add_argument("--no-download", action="store_true", default=False)
+    parser.add_argument(
+        "--search-depth", type=int, default=1, metavar="N",
+        help="How many sub-levels to search for datasets under --data-dir (default: 1).",
+    )
     parser.add_argument("--temp", action="store_true", default=False)
     parser.add_argument("-y", "--yes", action="store_true", default=False)
     parser.add_argument("--no-annotations", action="store_false", dest="show_annotations",
@@ -1033,6 +1065,7 @@ def multi_main():
         crop_padding=args.crop_padding,
         crop_min_size=args.crop_min_size,
         cache_limit=args.cache_limit,
+        search_depth=args.search_depth,
     )
 
     all_results = multi_run(cfg)
