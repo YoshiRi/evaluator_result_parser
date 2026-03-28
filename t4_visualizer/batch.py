@@ -216,6 +216,28 @@ def df_to_frames(df: pd.DataFrame) -> List[FrameRow]:
 # Download management
 # ---------------------------------------------------------------------------
 
+def find_dataset_in_dir(data_dir: Path, t4dataset_id: str, search_depth: int = 1) -> Optional[Path]:
+    """Return the path to *t4dataset_id* under *data_dir*, or None if not found.
+
+    search_depth=0  →  data_dir/<id>          (flat layout)
+    search_depth=1  →  data_dir/*/<id>  AND   data_dir/<id>  (one sub-level)
+    """
+    # Always check the flat layout first.
+    flat = data_dir / t4dataset_id
+    if flat.exists():
+        return flat
+
+    if search_depth >= 1:
+        for subdir in data_dir.iterdir():
+            if not subdir.is_dir():
+                continue
+            candidate = subdir / t4dataset_id
+            if candidate.exists():
+                return candidate
+
+    return None
+
+
 def _unique_datasets(frames: List[FrameRow]) -> List[FrameRow]:
     """Return one representative FrameRow per unique t4dataset_id (for prompts)."""
     seen: Dict[str, FrameRow] = {}
@@ -225,17 +247,51 @@ def _unique_datasets(frames: List[FrameRow]) -> List[FrameRow]:
     return list(seen.values())
 
 
-def confirm_downloads(frames: List[FrameRow]) -> bool:
+def confirm_downloads(
+    frames: List[FrameRow],
+    data_dir: Optional[Path] = None,
+    search_depth: int = 1,
+) -> bool:
     """Show datasets to be downloaded and ask the user for confirmation.
 
-    Returns True if the user approves, False otherwise.
+    If *data_dir* is given, already-present datasets are listed separately so
+    the user can make an informed go/no-go decision.
+
+    Returns True if the user approves (or nothing needs downloading), False otherwise.
     """
     unique = _unique_datasets(frames)
-    print("\nThe following datasets will be downloaded:")
-    for f in unique:
-        label = f.t4dataset_name if f.t4dataset_name else f.t4dataset_id
-        print(f"  - {label}  (id: {f.t4dataset_id})")
-    print(f"\nTotal: {len(unique)} dataset(s)\n")
+    total = len(unique)
+
+    present: List[FrameRow] = []
+    missing: List[FrameRow] = []
+    if data_dir is not None and data_dir.exists():
+        for f in unique:
+            if find_dataset_in_dir(data_dir, f.t4dataset_id, search_depth) is not None:
+                present.append(f)
+            else:
+                missing.append(f)
+    else:
+        missing = list(unique)
+
+    print(f"\nDatasets required for visualization: {total}")
+
+    if present:
+        print(f"\n  Already in {data_dir}  ({len(present)}):")
+        for f in present:
+            label = f.t4dataset_name if f.t4dataset_name else f.t4dataset_id
+            print(f"    [ok] {label}  (id: {f.t4dataset_id})")
+
+    if missing:
+        print(f"\n  Need to download  ({len(missing)}):")
+        for f in missing:
+            label = f.t4dataset_name if f.t4dataset_name else f.t4dataset_id
+            print(f"    [dl] {label}  (id: {f.t4dataset_id})")
+
+    print(f"\n  Summary: {total} total / {len(present)} present / {len(missing)} to download\n")
+
+    if not missing:
+        print("  All datasets already present — skipping download prompt.")
+        return True
 
     try:
         answer = input("Proceed with download? [y/N] ").strip().lower()
@@ -331,10 +387,16 @@ def visualize_frame(
     frame_out.mkdir(parents=True, exist_ok=True)
     prefix = _filename_prefix(frame)
 
+    from t4_visualizer.downloader import find_t4_root, patch_missing_t4_tables
+    t4_root = find_t4_root(dataset_path)
+    if t4_root != dataset_path:
+        print(f"  [batch] Nested layout detected, using T4 root: {t4_root}")
+    patch_missing_t4_tables(t4_root)
+
     kwargs = {}
     if version:
         kwargs["version"] = version
-    t4 = Tier4(str(dataset_path), **kwargs)
+    t4 = Tier4(str(t4_root), **kwargs)
 
     sample = find_sample_by_scene_and_index(t4, frame.scenario_name, frame.frame_index)
 
@@ -529,13 +591,28 @@ def print_summary(results: List[RowResult], output_dir: Path) -> None:
     print(f"{'='*60}")
 
     if fail:
-        print("\nFailed frames:")
+        # Deduplicate by t4dataset_id for a concise dataset-level view
+        failed_datasets: dict[str, list[str]] = {}
         for r in fail:
-            print(
-                f"  t4dataset_id={r.frame.t4dataset_id}  "
-                f"scenario={r.frame.scenario_name}  "
-                f"frame={r.frame.frame_index}\n    Error: {r.error}"
-            )
+            did = r.frame.t4dataset_id
+            entry = f"scenario={r.frame.scenario_name} frame={r.frame.frame_index}: {r.error}"
+            failed_datasets.setdefault(did, []).append(entry)
+
+        print(f"\nFailed datasets ({len(failed_datasets)} unique):")
+        for did, entries in failed_datasets.items():
+            print(f"  {did}")
+            for e in entries:
+                print(f"    {e}")
+
+        # Write machine-readable list for easy re-runs / debugging
+        failed_path = output_dir / "failed_datasets.txt"
+        with open(failed_path, "w") as fh:
+            for did, entries in failed_datasets.items():
+                fh.write(f"{did}\n")
+                for e in entries:
+                    fh.write(f"  {e}\n")
+                fh.write("\n")
+        print(f"\n  Failed datasets list: {failed_path}")
 
     summary_path = output_dir / "batch_summary.csv"
     summary_df = pd.DataFrame([
@@ -553,7 +630,7 @@ def print_summary(results: List[RowResult], output_dir: Path) -> None:
         for r in results
     ])
     summary_df.to_csv(summary_path, index=False)
-    print(f"\n  Summary CSV: {summary_path}")
+    print(f"  Summary CSV: {summary_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +819,7 @@ class MultiRunConfig:
     crop_padding: int = 40
     crop_min_size: int = 300
     cache_limit: int = 10
+    search_depth: int = 1
 
 
 def _parse_run_spec(s: str) -> RunSpec:
@@ -794,15 +872,6 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
         print(f"  {did}")
 
     # ------------------------------------------------------------------
-    # Confirmation
-    # ------------------------------------------------------------------
-    if cfg.do_download and not cfg.yes:
-        all_frames = [f for _, frames, _ in all_run_data for f in frames]
-        if not confirm_downloads(all_frames):
-            print("Download cancelled by user.")
-            sys.exit(0)
-
-    # ------------------------------------------------------------------
     # Phase 2: setup data dir + smart download
     # ------------------------------------------------------------------
     _tmp_ctx = None
@@ -814,6 +883,17 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
         data_dir = cfg.data_dir or Path("t4datasets")
         data_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n  Data directory: {data_dir.resolve()}")
+
+    # ------------------------------------------------------------------
+    # Confirmation (after data_dir is known so we can show present/missing)
+    # ------------------------------------------------------------------
+    if cfg.do_download and not cfg.yes:
+        all_frames = [f for _, frames, _ in all_run_data for f in frames]
+        # For temp dirs nothing is pre-existing, so pass None to skip the check.
+        preview_dir = None if cfg.use_temp else data_dir
+        if not confirm_downloads(all_frames, data_dir=preview_dir, search_depth=cfg.search_depth):
+            print("Download cancelled by user.")
+            sys.exit(0)
 
     try:
         from t4_visualizer.downloader import DatasetCache
@@ -834,13 +914,22 @@ def multi_run(cfg: MultiRunConfig) -> Dict[str, List[RowResult]]:
                     except Exception as e2:
                         print(f"  ERROR downloading {did}: {e2}")
         else:
+            found = {did: find_dataset_in_dir(data_dir, did, cfg.search_depth) for did in ids_ordered}
+            present_ids = [did for did, p in found.items() if p is not None]
+            missing_ids = [did for did, p in found.items() if p is None]
+            print(
+                f"\n  Dataset summary (--no-download): "
+                f"{len(ids_ordered)} total / "
+                f"{len(present_ids)} present / "
+                f"{len(missing_ids)} missing"
+            )
             for did in ids_ordered:
-                path = data_dir / did
-                if path.exists():
+                path = found[did]
+                if path is not None:
                     cache.touch(did)
                     dataset_paths[did] = path
                 else:
-                    msg = f"Dataset not found at {path} (--no-download)"
+                    msg = f"Dataset '{did}' not found under {data_dir} (search_depth={cfg.search_depth}, --no-download)"
                     print(f"  ERROR: {msg}")
                     if cfg.fail_fast:
                         raise FileNotFoundError(msg)
@@ -934,6 +1023,10 @@ def _parse_multi_args():
     parser.add_argument("--data-dir", default=None, metavar="PATH",
                         help="Persistent dataset cache directory (default: ./t4datasets).")
     parser.add_argument("--no-download", action="store_true", default=False)
+    parser.add_argument(
+        "--search-depth", type=int, default=1, metavar="N",
+        help="How many sub-levels to search for datasets under --data-dir (default: 1).",
+    )
     parser.add_argument("--temp", action="store_true", default=False)
     parser.add_argument("-y", "--yes", action="store_true", default=False)
     parser.add_argument("--no-annotations", action="store_false", dest="show_annotations",
@@ -972,6 +1065,7 @@ def multi_main():
         crop_padding=args.crop_padding,
         crop_min_size=args.crop_min_size,
         cache_limit=args.cache_limit,
+        search_depth=args.search_depth,
     )
 
     all_results = multi_run(cfg)

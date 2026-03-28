@@ -1101,7 +1101,12 @@ def main():
         kwargs["version"] = args.version
 
     try:
-        t4 = Tier4(str(dataset_path), **kwargs)
+        from t4_visualizer.downloader import find_t4_root, patch_missing_t4_tables
+        t4_root = find_t4_root(dataset_path)
+        if t4_root != dataset_path:
+            print(f"Nested layout detected, using T4 root: {t4_root}")
+        patch_missing_t4_tables(t4_root)
+        t4 = Tier4(str(t4_root), **kwargs)
     except Exception as e:
         print(f"ERROR: Failed to load dataset: {e}")
         sys.exit(1)

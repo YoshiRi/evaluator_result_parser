@@ -422,46 +422,35 @@ def _find_webauto_nested(root: Path, t4dataset_id: str) -> Optional[Path]:
 
 
 def _try_flatten(root: Path, t4dataset_id: str, dst: Optional[Path] = None) -> bool:
-    """Move contents of webauto's versioned dir into *dst* (default: *root*).
+    """Move webauto's versioned directory to *dst*.
 
-    Handles two layouts produced by webauto depending on how ``--asset-dir``
-    was specified:
+    webauto places data at::
 
-    * ``root/annotation_dataset/<uuid>/<version>/``  (new downloads, root = dest_dir)
-    * ``root/annotation_dataset/<uuid>/<version>/``  (old downloads, root = dest_dir/uuid)
+        root/annotation_dataset/<t4dataset_id>/<version>/
 
-    Items are moved into *dst* only if they don't already exist there, so
-    a partially-flattened directory is safe to re-process.  Empty wrapper
-    directories are removed afterwards (best-effort).
+    This function moves that versioned directory to *dst* (default: *root*),
+    then removes the now-empty ``annotation_dataset/<t4dataset_id>/`` wrapper.
 
-    Returns True if any items were moved.
+    Returns True if the directory was moved.
     """
     src = _find_webauto_nested(root, t4dataset_id)
     if src is None:
         return False
     if dst is None:
         dst = root
-    dst.mkdir(parents=True, exist_ok=True)
-    moved = False
-    for item in list(src.iterdir()):
-        target = dst / item.name
-        if not target.exists():
-            print(f"  [downloader] Moving {item.name}  →  {dst}")
-            shutil.move(str(item), str(target))
-            moved = True
-    # Remove now-empty wrapper dirs (annotation_dataset/<uuid>/<version>/ etc.)
-    for d in [src, src.parent, src.parent.parent]:
+    print(f"  [downloader] Moving {src}  →  {dst}")
+    shutil.move(str(src), str(dst))
+    # Remove now-empty wrapper dirs (annotation_dataset/<t4dataset_id>/ etc.)
+    for d in [src.parent, src.parent.parent]:
         try:
             d.rmdir()
         except OSError:
             break
-    return moved
+    return True
 
 
-def _looks_like_t4dataset(path: Path) -> bool:
-    """Heuristic check: does this directory contain T4 annotation files?"""
-    # T4 datasets have an annotation directory (or versioned annotation dir)
-    # containing sample.json / scene.json etc.
+def _is_t4_root(path: Path) -> bool:
+    """Return True if *path* directly contains T4 annotation files."""
     for candidate in [
         path / "annotation",
         *sorted(path.glob("v1.0-*")),
@@ -469,8 +458,105 @@ def _looks_like_t4dataset(path: Path) -> bool:
     ]:
         if (candidate / "sample.json").exists() or (candidate / "scene.json").exists():
             return True
-    # Also accept if sample.json is directly in the path (flat layout)
     return (path / "sample.json").exists() or (path / "scene.json").exists()
+
+
+def _looks_like_t4dataset(path: Path) -> bool:
+    """Return True if *path* contains T4 annotation files (direct or one level nested).
+
+    Handles two webauto download layouts:
+
+    Normal layout::
+
+        path/annotation/sample.json
+
+    Nested layout (extra UUID subdirectory)::
+
+        path/<uuid>/annotation/sample.json
+        path/map/
+    """
+    if _is_t4_root(path):
+        return True
+    # Also accept if an immediate subdirectory is the T4 root (extra UUID nesting).
+    try:
+        for subdir in path.iterdir():
+            if subdir.is_dir() and _is_t4_root(subdir):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def find_t4_root(path: Path) -> Path:
+    """Return the directory that should be passed to ``Tier4()``.
+
+    Resolves two webauto download layouts:
+
+    Normal layout — data directly in *path*::
+
+        path/annotation/...   →  returns path
+
+    Nested layout — extra UUID subdirectory::
+
+        path/<uuid>/annotation/...
+        path/map/             →  returns path/<uuid>/
+
+    Falls back to *path* if neither layout is recognised (lets Tier4
+    raise its own informative error).
+    """
+    if _is_t4_root(path):
+        return path
+    try:
+        for subdir in sorted(path.iterdir()):
+            if subdir.is_dir() and _is_t4_root(subdir):
+                return subdir
+    except OSError:
+        pass
+    return path
+
+
+def patch_missing_t4_tables(t4_root: Path) -> None:
+    """Create empty JSON stubs for mandatory T4 tables that are absent on disk.
+
+    Some webauto exports omit tables like ``attribute.json`` when the dataset
+    contains no entries for that table.  ``t4_devkit`` still requires the file
+    to exist (even if empty), so we create ``[]`` stubs on-the-fly without
+    modifying the original data for tables that are known-safe to be empty.
+    """
+    # Locate annotation directories by searching for `sample.json`, which is
+    # the canonical anchor file for T4 annotation dirs regardless of the
+    # directory name (annotation/, v1.0-trainval/, 1/, etc.).
+    ann_dirs: list[Path] = []
+    for depth1 in [t4_root, *t4_root.iterdir()]:
+        if not depth1.is_dir():
+            continue
+        if (depth1 / "sample.json").exists():
+            ann_dirs.append(depth1)
+            continue
+        try:
+            for depth2 in depth1.iterdir():
+                if depth2.is_dir() and (depth2 / "sample.json").exists():
+                    ann_dirs.append(depth2)
+        except OSError:
+            pass
+
+    if not ann_dirs:
+        return
+
+    # Tables that are safe to be empty (no entries = valid empty list).
+    # Structural tables (sample, sensor, calibrated_sensor, …) are NOT listed
+    # here because an empty stub would silently hide real data problems.
+    SAFE_EMPTY = [
+        "attribute.json",
+        "visibility.json",
+        "lidarseg.json",
+    ]
+    for ann_dir in ann_dirs:
+        for name in SAFE_EMPTY:
+            target = ann_dir / name
+            if not target.exists():
+                print(f"  [t4-patch] Creating empty stub: {target}")
+                target.write_text("[]")
 
 
 def _dir_size_mb(path: Path) -> float:
