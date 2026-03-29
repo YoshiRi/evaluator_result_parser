@@ -360,6 +360,137 @@ def visualize_static(
         plt.show()
 
 
+# ---------------------------------------------------------------------------
+# Programmatic render API  (returns bytes, no file I/O required by caller)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VisualizationRequest:
+    """Parameters for a single-frame render.  Passed to :func:`render_frame`."""
+
+    dataset_path: Path
+    """Local path to the T4 dataset root directory."""
+
+    scenario_name: str
+    """Scene name inside the dataset (e.g. ``"scene-0001"``)."""
+
+    frame_index: int
+    """0-based frame index within the scene."""
+
+    target_objects: List[TargetObject] = field(default_factory=list)
+    """Objects to highlight in the visualization."""
+
+    cameras: Optional[List[str]] = None
+    """Camera channels to render (``None`` = all available)."""
+
+    show_annotations: bool = True
+    """Overlay bounding boxes on camera images and BEV."""
+
+    version: Optional[str] = None
+    """T4 dataset version string (``None`` = auto-detect)."""
+
+    crop_cameras: bool = False
+    """Crop camera view to the region containing target objects."""
+
+    crop_padding: int = 40
+    crop_min_size: int = 300
+
+
+@dataclass
+class RenderImage:
+    """One rendered figure as PNG bytes."""
+
+    data: bytes
+    """Raw PNG bytes."""
+
+    label: str
+    """``"combined"`` for standard layout; camera channel name for crop mode."""
+
+
+@dataclass
+class VisualizationResult:
+    """Output of :func:`render_frame`."""
+
+    images: List[RenderImage]
+    """Rendered figures.  Standard mode: one item.  Crop mode: one per camera."""
+
+    sample_token: str
+    timestamp_us: int
+
+
+def render_frame(
+    request: VisualizationRequest,
+    t4=None,
+) -> VisualizationResult:
+    """Render a single frame and return PNG bytes without writing to disk.
+
+    Args:
+        request: Rendering parameters.
+        t4: Pre-loaded ``Tier4`` instance for *request.dataset_path*.
+            When omitted the dataset is loaded inside this call.
+            Pass a cached instance to avoid reloading the same dataset
+            repeatedly (e.g. in a server or parallel worker).
+
+    Returns:
+        :class:`VisualizationResult` containing one or more PNG images.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    if t4 is None:
+        try:
+            from t4_devkit import Tier4
+        except ImportError as exc:
+            raise ImportError(
+                "t4_devkit is not installed. "
+                "Install with: pip install git+https://github.com/tier4/t4-devkit.git"
+            ) from exc
+        from t4_visualizer.downloader import find_t4_root, patch_missing_t4_tables
+        t4_root = find_t4_root(_Path(request.dataset_path))
+        patch_missing_t4_tables(t4_root)
+        kwargs = {"version": request.version} if request.version else {}
+        t4 = Tier4(str(t4_root), **kwargs)
+
+    sample = find_sample_by_scene_and_index(t4, request.scenario_name, request.frame_index)
+
+    _RENDER_PREFIX = "_render"
+
+    with tempfile.TemporaryDirectory(prefix="t4render_") as tmpdir:
+        visualize_static(
+            t4,
+            sample,
+            cameras=request.cameras,
+            show_annotations=request.show_annotations,
+            save_dir=tmpdir,
+            filename_prefix=_RENDER_PREFIX,
+            target_objects=request.target_objects,
+            crop_cameras=request.crop_cameras,
+            crop_padding=request.crop_padding,
+            crop_min_size=request.crop_min_size,
+        )
+
+        images: List[RenderImage] = []
+        for png_path in sorted(_Path(tmpdir).glob("*.png")):
+            stem = png_path.stem  # e.g. "_render_visualization" or "_render_CAM_FRONT_visualization_crop"
+            if stem.endswith("_visualization"):
+                label = "combined"
+            elif "_visualization_crop" in stem:
+                # "_render_CAM_FRONT_visualization_crop" → "CAM_FRONT"
+                label = stem[len(_RENDER_PREFIX) + 1 : stem.index("_visualization_crop")]
+            else:
+                label = stem
+            images.append(RenderImage(data=png_path.read_bytes(), label=label))
+
+    return VisualizationResult(
+        images=images,
+        sample_token=sample.token,
+        timestamp_us=sample.timestamp,
+    )
+
+
 def _fill_camera_axes(t4, sample, camera_channels, show_annotations, axes,
                       target_ann_tokens, target_objects):
     """Render camera images and detection overlays onto the given axes list."""
