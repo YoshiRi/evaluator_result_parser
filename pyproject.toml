@@ -13,12 +13,19 @@ dependencies = [
     "Pillow",
 ]
 
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+]
+
 [project.scripts]
 t4-batch = "t4_visualizer.batch:main"
 t4-visualize = "t4_visualizer.visualize:main"
 t4-inspect = "t4_visualizer.inspect:main"
 t4-cache = "t4_visualizer.downloader:cache_main"
 t4-multi = "t4_visualizer.batch:multi_main"
+t4-server = "t4_visualizer.server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
