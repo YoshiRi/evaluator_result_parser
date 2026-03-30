@@ -25,14 +25,39 @@ evaluator_result_parser/
 
 ---
 
-## インストール
+## インストール・起動
+
+### 新規 PC への一発セットアップ（推奨）
+
+[uv](https://docs.astral.sh/uv/getting-started/installation/) が必要です。
 
 ```bash
-# 依存ライブラリのインストール
+# 環境構築（初回のみ）
+bash setup.sh
+
+# サーバー起動
+bash serve.sh
+```
+
+`setup.sh` は仮想環境の作成・依存ライブラリのインストール・動作確認を自動で行います。
+`serve.sh` はデフォルトで `/mnt/qnapdata/internal/t4datasets` を参照してサーバーを起動します。
+
+```bash
+# オプション例
+bash setup.sh --python 3.11 --venv .venv
+bash serve.sh --data-dir /path/to/datasets --port 8080
+```
+
+詳細は各スクリプトの `--help` を参照してください。
+
+### 手動インストール
+
+```bash
+# 依存ライブラリ
 pip install pandas matplotlib seaborn numpy pillow pyarrow
 pip install git+https://github.com/tier4/t4-devkit.git
 
-# パッケージ本体（CLI コマンドを使う場合は必須）
+# パッケージ本体
 pip install -e .
 
 # HTTP サーバーも使う場合（fastapi + uvicorn を追加）
@@ -446,19 +471,26 @@ with ThreadPoolExecutor(max_workers=4) as ex:
 #### 起動
 
 ```bash
-pip install -e ".[server]"   # fastapi + uvicorn
+# serve.sh を使う場合（推奨）
+bash serve.sh
+bash serve.sh --data-dir /mnt/t4data --port 8080
 
-# 基本
-t4-server --data-dir /mnt/t4data
-
-# ポート・キャッシュサイズ指定
+# t4-server を直接使う場合
 t4-server --data-dir /mnt/t4data --port 8080 --tier4-cache 4
-
-# 1段ネスト構造 (dest_dir/*/<id>) の場合（デフォルトで対応済み）
-t4-server --data-dir /mnt/server/datasets --search-depth 1
 ```
 
-オプション一覧:
+起動すると接続先 URL が表示されます:
+
+```
+  ローカル          : http://localhost:8000
+  ネットワーク内    : http://192.168.1.42:8000
+
+  API ドキュメント  : http://localhost:8000/docs
+  ヘルスチェック    : http://localhost:8000/health
+  データセット一覧  : http://localhost:8000/datasets
+```
+
+`serve.sh` / `t4-server` オプション一覧:
 
 | オプション | デフォルト | 説明 |
 |---|---|---|
@@ -657,6 +689,28 @@ t4-cache clear
 # カスタムディレクトリ・上限を指定
 t4-cache --data-dir /mnt/ssd/t4data --limit 5 status
 ```
+
+#### 読み取り専用ファイルシステムへの対応（シャドウキャッシュ）
+
+CIFS / NFS マウントなど書き込み不可の場所にデータセットがある場合、
+一部の webauto エクスポートに含まれない JSON テーブル（`lidarseg.json` 等）の
+スタブファイルをそこに書き込もうとして `Permission denied` が発生することがあります。
+
+この場合、自動的に **ローカルシャドウ** が作成されます：
+
+```
+~/.cache/t4_shadow/<hash>/
+    0/
+        annotation/   ← annotation JSON のローカルコピー（スタブを書き込む）
+        data          → NAS の data/ へのシンボリックリンク
+```
+
+スタブはローカルコピーへ書かれ、NAS には一切書き込みません。
+画像・点群データはシンボリックリンク経由で NAS から直接読まれます。
+
+> **Note**: このシャドウキャッシュは t4_devkit の upstream の問題（オプションテーブルが
+> 欠損している場合に `FileNotFoundError` を投げる）に対するワークアラウンドです。
+> t4_devkit 側が修正された際にはこの仕組みを除去する予定です。
 
 ---
 
