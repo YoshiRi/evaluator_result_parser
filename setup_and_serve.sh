@@ -9,6 +9,7 @@
 #   --data-dir PATH        データセット保管ディレクトリ (デフォルト: ~/t4datasets)
 #   --search-depth N       サブディレクトリ探索深さ (デフォルト: 1)
 #   --port PORT            サーバーポート (デフォルト: 8000)
+#   --host HOST            バインドアドレス (デフォルト: 0.0.0.0 = 全インターフェース)
 #   --tier4-cache N        メモリ上に保持する Tier4 インスタンス数 (デフォルト: 8)
 #   --project-id ID        webauto プロジェクト ID (WEBAUTO_PROJECT_ID 環境変数でも可)
 #   --python VERSION       Python バージョン指定、例: 3.11 (デフォルト: 3.11)
@@ -25,6 +26,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 DATA_DIR="${HOME}/t4datasets"
 SEARCH_DEPTH=1
+HOST="0.0.0.0"
 PORT=8000
 TIER4_CACHE=8
 WEBAUTO_PROJECT_ID="${WEBAUTO_PROJECT_ID:-}"
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --data-dir)      DATA_DIR="$2";           shift 2 ;;
         --search-depth)  SEARCH_DEPTH="$2";       shift 2 ;;
         --port)          PORT="$2";               shift 2 ;;
+        --host)          HOST="$2";               shift 2 ;;
         --tier4-cache)   TIER4_CACHE="$2";        shift 2 ;;
         --project-id)    WEBAUTO_PROJECT_ID="$2"; shift 2 ;;
         --python)        PYTHON_VERSION="$2";     shift 2 ;;
@@ -176,6 +179,7 @@ echo "  セットアップ完了"
 echo "============================================================"
 echo "  データディレクトリ : $DATA_DIR"
 echo "  Search depth      : $SEARCH_DEPTH"
+echo "  ホスト            : $HOST"
 echo "  ポート            : $PORT"
 echo "  Tier4 キャッシュ  : $TIER4_CACHE"
 [[ -n "$WEBAUTO_PROJECT_ID" ]] && echo "  webauto project   : $WEBAUTO_PROJECT_ID"
@@ -186,8 +190,9 @@ if [[ "$NO_SERVER" == true ]]; then
     info "サーバーの起動をスキップします (--no-server)。"
     echo ""
     echo "手動起動コマンド:"
-    echo "  $T4SERVER --data-dir \"$DATA_DIR\" --search-depth $SEARCH_DEPTH \\"
-    echo "            --port $PORT --tier4-cache $TIER4_CACHE"
+    echo "  $T4SERVER --host \"$HOST\" --port $PORT \\"
+    echo "            --data-dir \"$DATA_DIR\" --search-depth $SEARCH_DEPTH \\"
+    echo "            --tier4-cache $TIER4_CACHE"
     exit 0
 fi
 
@@ -195,16 +200,30 @@ fi
 # Step 7: サーバー起動
 # ---------------------------------------------------------------------------
 info "=== Step 7: t4-server 起動 ==="
+
+# LAN IP を表示してネットワーク越しのアクセス先を明示する
+LAN_IP=""
+if command -v ip &>/dev/null; then
+    LAN_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+elif command -v ifconfig &>/dev/null; then
+    LAN_IP=$(ifconfig | awk '/inet /&&!/127.0.0.1/{print $2; exit}')
+fi
+
 echo ""
-echo "  API ドキュメント: http://localhost:${PORT}/docs"
-echo "  ヘルスチェック  : http://localhost:${PORT}/health"
-echo "  データセット一覧: http://localhost:${PORT}/datasets"
+echo "  ローカル          : http://localhost:${PORT}"
+[[ -n "$LAN_IP" ]] && \
+echo "  ネットワーク内    : http://${LAN_IP}:${PORT}"
+echo ""
+echo "  API ドキュメント  : http://localhost:${PORT}/docs"
+echo "  ヘルスチェック    : http://localhost:${PORT}/health"
+echo "  データセット一覧  : http://localhost:${PORT}/datasets"
 echo ""
 echo "  停止するには Ctrl+C を押してください。"
 echo "============================================================"
 echo ""
 
 exec "$T4SERVER" \
+    --host "$HOST" \
     --data-dir "$DATA_DIR" \
     --search-depth "$SEARCH_DEPTH" \
     --port "$PORT" \
