@@ -113,34 +113,12 @@ class _Tier4Cache:
 
 # ---------------------------------------------------------------------------
 # Pydantic models (request / response)
+# Must be defined at module level — Pydantic v2 cannot resolve forward
+# references for classes defined inside a function scope.
 # ---------------------------------------------------------------------------
 
-def _build_app(data_dir: Path, search_depth: int, tier4_cache_size: int):
-    """Construct and return the FastAPI application."""
-    try:
-        from fastapi import FastAPI, HTTPException
-        from fastapi.responses import JSONResponse
-        from pydantic import BaseModel, Field
-    except ImportError as exc:
-        raise ImportError(
-            "fastapi and pydantic are required for the server. "
-            "Install with: pip install fastapi uvicorn"
-        ) from exc
-
-    from t4_visualizer.batch import find_dataset_in_dir
-    from t4_visualizer.visualize import (
-        RenderImage,
-        TargetObject,
-        VisualizationRequest,
-        render_frame,
-    )
-
-    app = FastAPI(title="T4 Visualizer", version="0.1.0")
-    _cache = _Tier4Cache(max_size=tier4_cache_size)
-
-    # ------------------------------------------------------------------
-    # Request / Response schemas
-    # ------------------------------------------------------------------
+try:
+    from pydantic import BaseModel, Field as _Field
 
     class TargetObjectIn(BaseModel):
         uuid: str = ""
@@ -157,7 +135,7 @@ def _build_app(data_dir: Path, search_depth: int, tier4_cache_size: int):
         t4dataset_id: str
         scenario_name: str
         frame_index: int
-        target_objects: List[TargetObjectIn] = Field(default_factory=list)
+        target_objects: List[TargetObjectIn] = _Field(default_factory=list)
         cameras: Optional[List[str]] = None
         show_annotations: bool = True
         version: Optional[str] = None
@@ -173,6 +151,34 @@ def _build_app(data_dir: Path, search_depth: int, tier4_cache_size: int):
         sample_token: str
         timestamp_us: int
         images: List[ImageOut]
+
+except ImportError:
+    pass  # Proper error is raised inside _build_app when fastapi is missing
+
+
+# ---------------------------------------------------------------------------
+
+def _build_app(data_dir: Path, search_depth: int, tier4_cache_size: int):
+    """Construct and return the FastAPI application."""
+    try:
+        from fastapi import FastAPI, HTTPException
+        from fastapi.responses import JSONResponse
+    except ImportError as exc:
+        raise ImportError(
+            "fastapi and pydantic are required for the server. "
+            "Install with: pip install fastapi uvicorn"
+        ) from exc
+
+    from t4_visualizer.batch import find_dataset_in_dir
+    from t4_visualizer.visualize import (
+        RenderImage,
+        TargetObject,
+        VisualizationRequest,
+        render_frame,
+    )
+
+    app = FastAPI(title="T4 Visualizer", version="0.1.0")
+    _cache = _Tier4Cache(max_size=tier4_cache_size)
 
     # ------------------------------------------------------------------
     # Helpers
