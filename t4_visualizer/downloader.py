@@ -515,6 +515,82 @@ def find_t4_root(path: Path) -> Path:
     return path
 
 
+def _can_write_dir(path: Path) -> bool:
+    """Return True if the current process can write to *path*."""
+    return os.access(path, os.W_OK)
+
+
+def _make_shadow(t4_root: Path) -> Path:
+    """Return a writable local shadow of *t4_root*.
+
+    The shadow contains:
+    - A copy of every annotation JSON file (writable, patchable).
+    - Symlinks for every non-JSON entry (images, point clouds, etc.)
+      pointing back to the originals on the source filesystem.
+
+    The shadow root lives under ~/.cache/t4_shadow/ and is keyed by the
+    absolute real path of *t4_root*, so the same dataset always reuses
+    the same shadow.
+    """
+    import hashlib
+    import shutil
+
+    key = hashlib.sha1(str(t4_root.resolve()).encode()).hexdigest()[:16]
+    shadow_root = Path.home() / ".cache" / "t4_shadow" / key
+    shadow_root.mkdir(parents=True, exist_ok=True)
+
+    # Walk the source tree and mirror its structure locally.
+    for src in t4_root.rglob("*"):
+        rel = src.relative_to(t4_root)
+        dst = shadow_root / rel
+
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        elif src.suffix == ".json":
+            # Copy JSON files so stubs can be added without touching the source.
+            if not dst.exists():
+                shutil.copy2(src, dst)
+        else:
+            # Symlink everything else (images, .pcd.bin, …) to avoid copies.
+            if not dst.exists():
+                dst.symlink_to(src.resolve())
+
+    return shadow_root
+
+
+def prepare_dataset_root(t4_root: Path) -> Path:
+    """Return a writable root for *t4_root*, creating a local shadow if needed.
+
+    This is a workaround for t4_devkit requiring stub files (``[]``) for
+    optional tables that may be absent in some dataset exports.  When the
+    source filesystem is read-only (e.g. a CIFS/NFS mount without write
+    permission), stubs are written to a local shadow copy instead.
+
+    TODO: Remove this function once t4_devkit handles missing optional tables
+    gracefully without requiring the files to exist on disk.
+    Upstream issue to file: t4_devkit should catch FileNotFoundError for
+    optional tables (attribute, visibility, lidarseg) and return [] instead.
+    """
+    # Find the annotation directory to check write access.
+    # Fall back to t4_root itself if no ann_dir is detected yet.
+    probe_dir = t4_root
+    for depth1 in [t4_root, *t4_root.iterdir()]:
+        if depth1.is_dir() and (depth1 / "sample.json").exists():
+            probe_dir = depth1
+            break
+        if depth1.is_dir():
+            for depth2 in depth1.iterdir():
+                if depth2.is_dir() and (depth2 / "sample.json").exists():
+                    probe_dir = depth2
+                    break
+
+    if _can_write_dir(probe_dir):
+        return t4_root  # Source is writable — no shadow needed.
+
+    print(f"  [t4-shadow] Source not writable, creating local shadow for {t4_root.name}")
+    return _make_shadow(t4_root)
+
+
 def patch_missing_t4_tables(t4_root: Path) -> None:
     """Create empty JSON stubs for mandatory T4 tables that are absent on disk.
 

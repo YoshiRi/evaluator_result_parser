@@ -102,8 +102,9 @@ class _Tier4Cache:
                 "Install with: pip install git+https://github.com/tier4/t4-devkit.git"
             ) from exc
 
-        from t4_visualizer.downloader import find_t4_root, patch_missing_t4_tables
+        from t4_visualizer.downloader import find_t4_root, prepare_dataset_root, patch_missing_t4_tables
         t4_root = find_t4_root(path)
+        t4_root = prepare_dataset_root(t4_root)
         patch_missing_t4_tables(t4_root)
         kwargs = {"version": version} if version else {}
         t4 = Tier4(str(t4_root), **kwargs)
