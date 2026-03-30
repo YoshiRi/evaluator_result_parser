@@ -16,23 +16,52 @@ evaluator_result_parser/
 │   └── metrics_visualizer.py # TPrate / mAP・距離別分析
 │
 └── t4_visualizer/            # T4 dataset の可視化ツール
-    ├── visualize.py          # UUID + タイムスタンプで1シーンを可視化
+    ├── visualize.py          # UUID + タイムスタンプで1シーンを可視化 / render API
     ├── batch.py              # CSV/Parquet から複数シーンをバッチ可視化
+    ├── server.py             # HTTP サーバー（FastAPI）
     ├── inspect.py            # データセット内のシーン・センサー情報を表示
     └── downloader.py         # webauto DL + LRU キャッシュ管理
 ```
 
 ---
 
-## インストール
+## インストール・起動
+
+### 新規 PC への一発セットアップ（推奨）
+
+[uv](https://docs.astral.sh/uv/getting-started/installation/) が必要です。
 
 ```bash
-# 依存ライブラリのインストール
+# 環境構築（初回のみ）
+bash setup.sh
+
+# サーバー起動
+bash serve.sh
+```
+
+`setup.sh` は仮想環境の作成・依存ライブラリのインストール・動作確認を自動で行います。
+`serve.sh` はデフォルトで `/mnt/qnapdata/internal/t4datasets` を参照してサーバーを起動します。
+
+```bash
+# オプション例
+bash setup.sh --python 3.11 --venv .venv
+bash serve.sh --data-dir /path/to/datasets --port 8080
+```
+
+詳細は各スクリプトの `--help` を参照してください。
+
+### 手動インストール
+
+```bash
+# 依存ライブラリ
 pip install pandas matplotlib seaborn numpy pillow pyarrow
 pip install git+https://github.com/tier4/t4-devkit.git
 
-# パッケージ本体（CLI コマンドを使う場合は必須）
+# パッケージ本体
 pip install -e .
+
+# HTTP サーバーも使う場合（fastapi + uvicorn を追加）
+pip install -e ".[server]"
 ```
 
 `pip install -e .` で以下の CLI コマンドが利用できるようになります:
@@ -44,6 +73,7 @@ pip install -e .
 | `t4-multi` | 複数の CSV を一括処理 |
 | `t4-inspect` | データセットの情報確認 |
 | `t4-cache` | ローカルキャッシュの管理 |
+| `t4-server` | HTTP API サーバーを起動（要 `.[server]`） |
 
 ---
 
@@ -295,7 +325,24 @@ t4-multi improve.csv degrade.csv -o ./viz --yes
 
 # 並列処理 + crop 表示
 t4-multi improve:improve.csv degrade:degrade.csv -o ./viz -j 4 --crop-view
+
+# サーバー上の1段ネスト構成 (dest_dir/*/<id>) に対応する場合
+t4-multi improve:improve.csv -o ./viz --no-download \
+    --data-dir /mnt/server/datasets --search-depth 1
 ```
+
+#### --search-depth — ネストされたデータセットレイアウトへの対応
+
+データセットサーバーによっては `dest_dir/*/<t4dataset_id>` のようにグループフォルダが
+1段挟まる場合があります。`--search-depth N`（デフォルト `1`）でサブディレクトリを探索します。
+
+| layout | 必要な search-depth |
+|---|---|
+| `dest_dir/<id>/` | 0 または 1（フラットは常に優先検索） |
+| `dest_dir/group/<id>/` | 1（デフォルト） |
+
+`--no-download` 時の present / missing サマリーおよびダウンロード前確認の
+表示も同じ depth で計算されます。
 
 内部で**3フェーズ**処理が行われます:
 1. **Load** — 全 CSV を読み込み、必要なデータセット ID の集合を収集
@@ -313,6 +360,219 @@ t4-multi improve:improve.csv degrade:degrade.csv -o ./viz -j 4 --crop-view
     ├── batch_summary.csv
     └── ...
 ```
+
+### render_frame — Python API（ファイル書き出し不要）
+
+`render_frame` は1フレームをレンダリングして **PNG バイト列** を返す関数です。
+ファイルシステムを介さないため、HTTP レスポンスへの直接埋め込みや並列処理に使えます。
+
+```python
+from pathlib import Path
+from t4_visualizer.visualize import (
+    VisualizationRequest,
+    TargetObject,
+    render_frame,
+)
+
+request = VisualizationRequest(
+    dataset_path=Path("/mnt/t4data/abc123"),
+    scenario_name="scene-0001",
+    frame_index=5,
+    target_objects=[
+        TargetObject(uuid="", x=10.5, y=2.3, z=0.5, label="car"),
+    ],
+    crop_cameras=True,   # 対象物周辺をクロップ
+)
+
+result = render_frame(request)
+# result.images  : List[RenderImage]
+# result.sample_token : str
+# result.timestamp_us : int
+
+for img in result.images:
+    print(img.label)           # "combined" or カメラチャンネル名
+    Path(f"{img.label}.png").write_bytes(img.data)
+```
+
+#### キャッシュ済み Tier4 を渡して高速化
+
+同一データセットを繰り返しレンダリングする場合、`Tier4` インスタンスを外部でキャッシュして
+`t4` 引数に渡すとロードコストを省けます。
+
+```python
+from t4_devkit import Tier4
+
+t4 = Tier4("/mnt/t4data/abc123")   # 一度だけロード
+for frame_index in range(10):
+    req = VisualizationRequest(
+        dataset_path=Path("/mnt/t4data/abc123"),
+        scenario_name="scene-0001",
+        frame_index=frame_index,
+    )
+    result = render_frame(req, t4=t4)   # ロード不要
+```
+
+#### 並列処理
+
+`render_frame` は副作用なし（各呼び出しがローカルな一時ディレクトリを使用）なので
+`ThreadPoolExecutor` にそのまま投げられます。
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+requests = [
+    VisualizationRequest(dataset_path=..., scenario_name=..., frame_index=i)
+    for i in range(20)
+]
+
+with ThreadPoolExecutor(max_workers=4) as ex:
+    results = list(ex.map(render_frame, requests))
+```
+
+#### データ型まとめ
+
+**VisualizationRequest**
+
+| フィールド | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `dataset_path` | `Path` | 必須 | T4 dataset root のローカルパス |
+| `scenario_name` | `str` | 必須 | シーン名 |
+| `frame_index` | `int` | 必須 | 0始まりのフレーム番号 |
+| `target_objects` | `List[TargetObject]` | `[]` | ハイライト対象の物体リスト |
+| `cameras` | `Optional[List[str]]` | `None` | 表示カメラ（省略=全カメラ） |
+| `show_annotations` | `bool` | `True` | アノテーション表示 |
+| `version` | `Optional[str]` | `None` | データセットバージョン |
+| `crop_cameras` | `bool` | `False` | 対象物周辺クロップモード |
+| `crop_padding` | `int` | `40` | クロップの余白ピクセル |
+| `crop_min_size` | `int` | `300` | クロップの最小サイズ（ピクセル） |
+
+**VisualizationResult**
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `images` | `List[RenderImage]` | 生成された図（標準モード: 1件、クロップモード: カメラ数分） |
+| `sample_token` | `str` | レンダリングしたサンプルのトークン |
+| `timestamp_us` | `int` | サンプルのタイムスタンプ（マイクロ秒） |
+
+**RenderImage**
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `data` | `bytes` | PNG バイト列 |
+| `label` | `str` | `"combined"`（標準）またはカメラチャンネル名（クロップ） |
+
+---
+
+### t4-server — HTTP API サーバー
+
+`render_frame` を HTTP 経由で呼び出せるサーバーです。
+複数のデータセットを事前にキャッシュするため、繰り返しリクエストの際のロードコストを最小化します。
+
+#### 起動
+
+```bash
+# serve.sh を使う場合（推奨）
+bash serve.sh
+bash serve.sh --data-dir /mnt/t4data --port 8080
+
+# t4-server を直接使う場合
+t4-server --data-dir /mnt/t4data --port 8080 --tier4-cache 4
+```
+
+起動すると接続先 URL が表示されます:
+
+```
+  ローカル          : http://localhost:8000
+  ネットワーク内    : http://192.168.1.42:8000
+
+  API ドキュメント  : http://localhost:8000/docs
+  ヘルスチェック    : http://localhost:8000/health
+  データセット一覧  : http://localhost:8000/datasets
+```
+
+`serve.sh` / `t4-server` オプション一覧:
+
+| オプション | デフォルト | 説明 |
+|---|---|---|
+| `--data-dir` | `./t4datasets` | データセットのルートディレクトリ |
+| `--search-depth` | `1` | サブディレクトリ探索の深さ |
+| `--host` | `0.0.0.0` | バインドホスト |
+| `--port` | `8000` | バインドポート |
+| `--tier4-cache` | `8` | メモリ上に保持する Tier4 インスタンス数 |
+| `--reload` | off | uvicorn auto-reload（開発用） |
+
+#### エンドポイント
+
+**`POST /render`** — フレームをレンダリング
+
+リクエスト:
+
+```json
+{
+    "t4dataset_id": "abc123",
+    "scenario_name": "scene-0001",
+    "frame_index": 5,
+    "target_objects": [
+        {"uuid": "", "x": 10.5, "y": 2.3, "z": 0.5, "label": "car",
+         "width": 1.8, "length": 4.5, "height": 1.6, "yaw": 0.3}
+    ],
+    "cameras": null,
+    "show_annotations": true,
+    "crop_cameras": true,
+    "crop_padding": 40,
+    "crop_min_size": 300
+}
+```
+
+レスポンス:
+
+```json
+{
+    "sample_token": "deadbeef...",
+    "timestamp_us": 1609459200000000,
+    "images": [
+        {
+            "label": "CAM_FRONT",
+            "png_base64": "iVBORw0KGgo..."
+        }
+    ]
+}
+```
+
+**`GET /health`** — サーバー死活確認
+
+```bash
+curl http://localhost:8000/health
+# {"status": "ok"}
+```
+
+**`GET /datasets`** — 利用可能なデータセット一覧
+
+```bash
+curl http://localhost:8000/datasets
+# {"data_dir": "/mnt/t4data", "datasets": ["abc123", "def456"]}
+```
+
+#### Python クライアント例
+
+```python
+import base64, requests
+from pathlib import Path
+
+resp = requests.post("http://localhost:8000/render", json={
+    "t4dataset_id": "abc123",
+    "scenario_name": "scene-0001",
+    "frame_index": 5,
+    "crop_cameras": True,
+})
+resp.raise_for_status()
+
+for img in resp.json()["images"]:
+    data = base64.b64decode(img["png_base64"])
+    Path(f"{img['label']}.png").write_bytes(data)
+```
+
+---
 
 ### downloader.py — ダウンローダーと LRU キャッシュ
 
@@ -429,6 +689,28 @@ t4-cache clear
 # カスタムディレクトリ・上限を指定
 t4-cache --data-dir /mnt/ssd/t4data --limit 5 status
 ```
+
+#### 読み取り専用ファイルシステムへの対応（シャドウキャッシュ）
+
+CIFS / NFS マウントなど書き込み不可の場所にデータセットがある場合、
+一部の webauto エクスポートに含まれない JSON テーブル（`lidarseg.json` 等）の
+スタブファイルをそこに書き込もうとして `Permission denied` が発生することがあります。
+
+この場合、自動的に **ローカルシャドウ** が作成されます：
+
+```
+~/.cache/t4_shadow/<hash>/
+    0/
+        annotation/   ← annotation JSON のローカルコピー（スタブを書き込む）
+        data          → NAS の data/ へのシンボリックリンク
+```
+
+スタブはローカルコピーへ書かれ、NAS には一切書き込みません。
+画像・点群データはシンボリックリンク経由で NAS から直接読まれます。
+
+> **Note**: このシャドウキャッシュは t4_devkit の upstream の問題（オプションテーブルが
+> 欠損している場合に `FileNotFoundError` を投げる）に対するワークアラウンドです。
+> t4_devkit 側が修正された際にはこの仕組みを除去する予定です。
 
 ---
 

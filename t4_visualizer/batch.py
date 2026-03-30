@@ -69,7 +69,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from t4_visualizer.visualize import TargetObject
+from t4_visualizer.visualize import TargetObject, VisualizationRequest, render_frame
 
 
 # ---------------------------------------------------------------------------
@@ -380,17 +380,17 @@ def visualize_frame(
         find_sample_by_scene_and_index,
         list_camera_channels,
         list_lidar_channels,
-        visualize_static,
     )
 
     frame_out = _status_dir(output_root, frame.status, has_status_column)
     frame_out.mkdir(parents=True, exist_ok=True)
     prefix = _filename_prefix(frame)
 
-    from t4_visualizer.downloader import find_t4_root, patch_missing_t4_tables
+    from t4_visualizer.downloader import find_t4_root, prepare_dataset_root, patch_missing_t4_tables
     t4_root = find_t4_root(dataset_path)
     if t4_root != dataset_path:
         print(f"  [batch] Nested layout detected, using T4 root: {t4_root}")
+    t4_root = prepare_dataset_root(t4_root)
     patch_missing_t4_tables(t4_root)
 
     kwargs = {}
@@ -421,18 +421,30 @@ def visualize_frame(
             f"lidars        : {list_lidar_channels(t4, sample)}\n"
         )
 
-    visualize_static(
-        t4,
-        sample,
+    # Render via the programmatic API, passing the already-loaded Tier4
+    # instance to avoid reloading the dataset.
+    request = VisualizationRequest(
+        dataset_path=t4_root,
+        scenario_name=frame.scenario_name,
+        frame_index=frame.frame_index,
+        target_objects=frame.target_objects,
         cameras=frame.cameras,
         show_annotations=show_annotations,
-        save_dir=str(frame_out),
-        filename_prefix=prefix,
-        target_objects=frame.target_objects,
+        version=version,
         crop_cameras=crop_cameras,
         crop_padding=crop_padding,
         crop_min_size=crop_min_size,
     )
+    result = render_frame(request, t4=t4)
+
+    for img in result.images:
+        if img.label == "combined":
+            filename = f"{prefix}_visualization.png"
+        else:
+            filename = f"{prefix}_{img.label}_visualization_crop.png"
+        out_path = frame_out / filename
+        out_path.write_bytes(img.data)
+        print(f"  Saved: {out_path}")
 
     return frame_out
 
