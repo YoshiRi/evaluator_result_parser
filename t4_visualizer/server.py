@@ -205,6 +205,137 @@ def _build_app(data_dir: Path, search_depth: int, tier4_cache_size: int):
     def health():
         return {"status": "ok"}
 
+    @app.get("/render/view")
+    def render_view(
+        t4dataset_id: str = "",
+        scenario_name: str = "",
+        frame_index: int = 0,
+        show_annotations: str = "true",
+        crop_cameras: str = "false",
+        crop_padding: int = 40,
+        crop_min_size: int = 300,
+    ):
+        """Browser-friendly debug viewer. Renders the frame and displays images inline."""
+        from fastapi.responses import HTMLResponse
+
+        # Build dataset list for the <datalist>
+        ds_list = []
+        if data_dir.exists():
+            for p in sorted(data_dir.iterdir()):
+                if p.is_dir() and not p.name.startswith("."):
+                    if (p / "annotation").exists() or (p / "data").exists():
+                        ds_list.append(p.name)
+                    elif search_depth >= 1:
+                        for sub in sorted(p.iterdir()):
+                            if sub.is_dir() and (
+                                (sub / "annotation").exists() or (sub / "data").exists()
+                            ):
+                                ds_list.append(sub.name)
+
+        datalist_options = "\n".join(
+            f'          <option value="{d}">' for d in sorted(set(ds_list))
+        )
+
+        # Render image section (only when parameters are provided)
+        images_html = ""
+        error_html = ""
+        show_ann_bool = show_annotations.lower() not in ("false", "0", "")
+        crop_cam_bool = crop_cameras.lower() not in ("false", "0", "")
+
+        if t4dataset_id and scenario_name:
+            try:
+                dataset_path = _resolve_dataset(t4dataset_id)
+                request = VisualizationRequest(
+                    dataset_path=dataset_path,
+                    scenario_name=scenario_name,
+                    frame_index=frame_index,
+                    show_annotations=show_ann_bool,
+                    crop_cameras=crop_cam_bool,
+                    crop_padding=crop_padding,
+                    crop_min_size=crop_min_size,
+                )
+                t4 = _cache.load(dataset_path)
+                result = render_frame(request, t4=t4)
+                imgs = []
+                for img in result.images:
+                    b64 = base64.b64encode(img.data).decode()
+                    imgs.append(
+                        f'<figure style="margin:0">'
+                        f'<figcaption style="font-weight:bold;margin-bottom:4px">{img.label}</figcaption>'
+                        f'<img src="data:image/png;base64,{b64}" style="max-width:100%;border:1px solid #ccc">'
+                        f'</figure>'
+                    )
+                meta = (
+                    f'<p style="color:#666;font-size:0.85em">'
+                    f'sample_token: {result.sample_token} &nbsp;|&nbsp; '
+                    f'timestamp: {result.timestamp_us} µs</p>'
+                )
+                images_html = meta + '<div style="display:flex;flex-wrap:wrap;gap:12px">' + "".join(imgs) + "</div>"
+            except Exception as exc:
+                error_html = f'<p style="color:red;font-weight:bold">Error: {exc}</p>'
+
+        checked_ann = "checked" if show_ann_bool else ""
+        checked_crop = "checked" if crop_cam_bool else ""
+
+        html = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>T4 Visualizer — Debug View</title>
+  <style>
+    body {{ font-family: sans-serif; max-width: 1200px; margin: 24px auto; padding: 0 16px; }}
+    form {{ display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; }}
+    input[type=text], input[type=number] {{ padding: 4px 8px; font-size: 1em; width: 100%; box-sizing: border-box; }}
+    button {{ margin-top: 8px; padding: 8px 24px; font-size: 1em; cursor: pointer; grid-column: 2; }}
+    hr {{ margin: 24px 0; }}
+  </style>
+</head>
+<body>
+  <h2>T4 Visualizer — Debug View</h2>
+  <form method="get" action="/render/view" id="form">
+    <label>Dataset ID</label>
+    <input type="text" name="t4dataset_id" value="{t4dataset_id}" list="ds-list" required>
+    <datalist id="ds-list">
+{datalist_options}
+    </datalist>
+
+    <label>Scenario name</label>
+    <input type="text" name="scenario_name" value="{scenario_name}" required>
+
+    <label>Frame index</label>
+    <input type="number" name="frame_index" value="{frame_index}" min="0">
+
+    <label>Show annotations</label>
+    <input type="checkbox" id="cb_ann" {checked_ann}>
+    <input type="hidden" name="show_annotations" id="hid_ann" value="{show_annotations}">
+
+    <label>Crop cameras</label>
+    <input type="checkbox" id="cb_crop" {checked_crop}>
+    <input type="hidden" name="crop_cameras" id="hid_crop" value="{crop_cameras}">
+
+    <label>Crop padding (px)</label>
+    <input type="number" name="crop_padding" value="{crop_padding}" min="0">
+
+    <label>Crop min size (px)</label>
+    <input type="number" name="crop_min_size" value="{crop_min_size}" min="0">
+
+    <button type="submit">Render</button>
+  </form>
+  <script>
+    document.getElementById("cb_ann").addEventListener("change", function() {{
+      document.getElementById("hid_ann").value = this.checked ? "true" : "false";
+    }});
+    document.getElementById("cb_crop").addEventListener("change", function() {{
+      document.getElementById("hid_crop").value = this.checked ? "true" : "false";
+    }});
+  </script>
+  <hr>
+  {error_html}
+  {images_html}
+</body>
+</html>"""
+        return HTMLResponse(html)
+
     @app.get("/datasets")
     def list_datasets():
         """Return dataset IDs visible under the configured data_dir."""
